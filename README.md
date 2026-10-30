@@ -134,10 +134,10 @@ campus-hunt-calibrate \
   --output-config calibrated_thresholds.json \
   --max-far 0.02 \
   --min-unknown-rejection 0.90 \
-  --min-calib-samples 1 \
-  --min-calib-unknown 1 \
-  --min-test-samples 1 \
-  --min-test-unknown 1 \
+  --min-calib-samples 5 \
+  --min-calib-unknown 10 \
+  --min-test-samples 5 \
+  --min-test-unknown 10 \
   --device cpu
 ```
 
@@ -145,19 +145,23 @@ campus-hunt-calibrate \
 1. **Calibration Split (`data/calibration/`)**:
    - Sweeps candidate match thresholds and margins.
    - Uses the **actual reference photo count** for each location from the embeddings store.
-   - Checks data adequacy: requires valid captures for all locations in the reference embeddings and in `unknown/`. If calibration data is inadequate, the tool reports missing locations and **refuses to write an unvalidated calibrated config**.
-   - **Data Safeguard Note**: Minimum capture thresholds (e.g. 1–3 per class) are practical data-quality safeguards to prevent empty/broken evaluation runs—they do **not** constitute statistical proof of model reliability on campus.
-2. **Fail-Closed Calibration (No Satisfying Threshold)**:
+   - **Sample-Count Safeguards**: Requires at least **5 independent captures per hunt location** and at least **10 unknown/distractor captures** by default (`--min-calib-samples 5`, `--min-calib-unknown 10`). A single photo per category cannot qualify as an adequate split.
+   - **Data Safeguard Note**: Minimum capture thresholds are practical data-quality safeguards to prevent degenerate or unrepresentative calibration—they do **not** constitute statistical proof of model reliability on campus. The team must still collect varied captures (across different phones, camera angles, lighting conditions, and times of day) and review confusion matrices.
+   - **Provisional Status on Lowered Minimums**: If a user manually overrides minimums below project standards (< 5 per location or < 10 unknown), the CLI emits a prominent warning and marks calibration status as `"provisional"` (`is_provisional=True`) in the metadata rather than implying verified evidence.
+2. **Fail-Closed Calibration (No Satisfying Threshold or Inadequate Data)**:
+   - If calibration data is inadequate (missing locations or counts below safeguard), calibration halts immediately with an error and **does not** create or overwrite any configuration.
    - If no candidate threshold pair meets all configured safety constraints (e.g. `FAR <= max_far` and `unknown_rejection >= min_unknown_rejection`), calibration **fails closed**:
      - It **does not** write or overwrite an active calibrated configuration (`scoring.calibrated=True`).
      - If an existing configuration file is present at `--output-config`, it remains untouched.
      - Files are written atomically on success.
      - The CLI prints a diagnostic summary and exits with a non-zero exit code (`1`).
      - An optional diagnostic report can be saved via `--diagnostic-report`, marked as `deployable: false, calibrated: false`.
-3. **Three-Outcome Hold-Out Test Split (`data/test/`)**:
+3. **Hold-Out Test Split Outcomes (`data/test/`)**:
+   - Requires at least **5 independent captures per hunt location** and at least **10 unknown/distractor captures** (`--min-test-samples 5`, `--min-test-unknown 10`) for a completed evaluation.
    - `unavailable`: No usable test captures in `data/test/`. Metrics are `null`, and missing categories are recorded.
-   - `incomplete`: Test captures exist, but some reference locations or `unknown/` are missing, or counts fall below minimum. Partial metrics are **not** presented as complete independent test performance (metrics are `null`), and missing categories are recorded with a clear message.
-   - `completed`: All required categories and sample counts are present. Selected thresholds are evaluated once to measure unbiased generalization performance.
+   - `incomplete`: Test captures exist, but some reference locations or `unknown/` are missing, or counts fall below minimums. Partial metrics are **not** presented as complete independent test performance (metrics are `null`), and missing categories are recorded with a clear message.
+   - `completed`: All required categories and sample counts meet or exceed the standard minimums (>= 5 per location, >= 10 unknown). Selected thresholds are evaluated once to measure unbiased generalization performance.
+   - `provisional`: If test minimums were manually lowered below project standards (< 5 or < 10) and met, test evaluation runs but is recorded as `"provisional"` with `is_provisional=True`, warning that the sample size does not guarantee generalization.
 4. **No Unmeasured Mismatch Threshold**:
    - Calibration tunes `match_threshold` and `margin_threshold`. It does **not** insert an arbitrary, unvalidated `mismatch_threshold: 0.30`. `mismatch_threshold` defaults to `None`. Teams advance strictly on the conservative `strong_match` criteria.
 
@@ -254,7 +258,16 @@ The configuration file written by `campus-hunt-calibrate` uses a nested structur
   },
   "calibration_metadata": {
     "model_version": "ViT-B-32/laion2b_s34b_b79k",
+    "status": "calibrated",
+    "is_provisional": false,
+    "warning": null,
     "calibrated_at": "2026-10-30T19:00:00Z",
+    "minimums_used": {
+      "min_calibration_samples_per_location": 5,
+      "min_calibration_unknown_samples": 10,
+      "min_test_samples_per_location": 5,
+      "min_test_unknown_samples": 10
+    },
     "calibration_sample_counts": {
       "clock_tower": 6,
       "library_atrium": 5,
@@ -274,10 +287,15 @@ The configuration file written by `campus-hunt-calibrate` uses a nested structur
         "unknown": 0
       },
       "missing_categories": [
-        "clock_tower (count=0 < 1)",
-        "library_atrium (count=0 < 1)",
-        "unknown (count=0 < 1)"
+        "clock_tower (count=0 < 5)",
+        "library_atrium (count=0 < 5)",
+        "unknown (count=0 < 10)"
       ],
+      "minimums_used": {
+        "min_test_samples_per_location": 5,
+        "min_test_unknown_samples": 10
+      },
+      "is_provisional": false,
       "metrics": null
     }
   }

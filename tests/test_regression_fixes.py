@@ -15,7 +15,15 @@ from campus_hunt_cv.cli.calibrate import (
     main as calibrate_main,
     run_calibration,
 )
-from campus_hunt_cv.config import CampusHuntConfig, ModelConfig, ScoringConfig
+from campus_hunt_cv.config import (
+    CampusHuntConfig,
+    DEFAULT_MIN_CALIBRATION_SAMPLES_PER_LOCATION,
+    DEFAULT_MIN_CALIBRATION_UNKNOWN_SAMPLES,
+    DEFAULT_MIN_TEST_SAMPLES_PER_LOCATION,
+    DEFAULT_MIN_TEST_UNKNOWN_SAMPLES,
+    ModelConfig,
+    ScoringConfig,
+)
 from campus_hunt_cv.decision import DecisionEngine
 from campus_hunt_cv.embeddings_store import ReferenceEmbeddingsStore
 from campus_hunt_cv.exceptions import ReferenceDataError
@@ -320,8 +328,8 @@ def test_fixA_test_outcomes_integration(tmp_path: Path, monkeypatch):
         pretrained="mock_test",
     )
 
-    # Populate adequate calibration set
-    populate_split(calib_dir, {"loc_a": 2, "loc_b": 2, "unknown": 2})
+    # Populate adequate calibration set (meets new default safeguards: >=5 per location, >=10 unknown)
+    populate_split(calib_dir, {"loc_a": 5, "loc_b": 5, "unknown": 10})
 
     # Mock embedder to avoid model downloads
     mock_emb = MockEmbedder(dimension=dim)
@@ -349,7 +357,7 @@ def test_fixA_test_outcomes_integration(tmp_path: Path, monkeypatch):
     assert len(loaded.calibration_metadata.test_evaluation.missing_categories) > 0
 
     # 2. Test Split is Partial (has loc_a only, missing loc_b and unknown) -> 'incomplete'
-    populate_split(test_dir, {"loc_a": 2})
+    populate_split(test_dir, {"loc_a": 5})
     success = run_calibration(
         calibration_dir=calib_dir,
         test_dir=test_dir,
@@ -368,8 +376,8 @@ def test_fixA_test_outcomes_integration(tmp_path: Path, monkeypatch):
     assert any("loc_b" in m for m in missing_cats)
     assert any("unknown" in m for m in missing_cats)
 
-    # 3. Test Split is Complete (has loc_a, loc_b, and unknown) -> 'completed'
-    populate_split(test_dir, {"loc_b": 2, "unknown": 2})
+    # 3. Test Split is Complete (has loc_a, loc_b, and unknown meeting >=5 and >=10) -> 'completed'
+    populate_split(test_dir, {"loc_b": 5, "unknown": 10})
     success = run_calibration(
         calibration_dir=calib_dir,
         test_dir=test_dir,
@@ -408,7 +416,7 @@ def test_fixB_calibration_fails_closed_when_constraints_unmet(tmp_path: Path, mo
         model_name="ViT-B-32",
         pretrained="mock_test",
     )
-    populate_split(calib_dir, {"loc_a": 2, "unknown": 2})
+    populate_split(calib_dir, {"loc_a": 5, "unknown": 10})
 
     mock_emb = MockEmbedder(dimension=dim)
     monkeypatch.setattr("campus_hunt_cv.cli.calibrate.OpenCLIPLocationEmbedder", lambda config: mock_emb)
@@ -457,7 +465,7 @@ def test_fixB_calibration_does_not_overwrite_existing_config_on_failure(tmp_path
         model_name="ViT-B-32",
         pretrained="mock_test",
     )
-    populate_split(calib_dir, {"loc_a": 2, "unknown": 2})
+    populate_split(calib_dir, {"loc_a": 5, "unknown": 10})
 
     # Pre-create an existing config with distinct signature
     original_config_content = json.dumps({"sentinel": "pre_existing_data", "timestamp": "12345"})
@@ -502,7 +510,7 @@ def test_fixB_cli_returns_nonzero_exit_code_on_failure(tmp_path: Path, monkeypat
         model_name="ViT-B-32",
         pretrained="mock_test",
     )
-    populate_split(calib_dir, {"loc_a": 2, "unknown": 2})
+    populate_split(calib_dir, {"loc_a": 5, "unknown": 10})
 
     mock_emb = MockEmbedder(dimension=dim)
     monkeypatch.setattr("campus_hunt_cv.cli.calibrate.OpenCLIPLocationEmbedder", lambda config: mock_emb)
@@ -653,3 +661,294 @@ def test_fix6_verifier_fails_safe_on_model_version_mismatch(mock_reference_store
     assert res["result"] == "ambiguous"
     assert res["reason_code"] == "ERROR_MODEL_VERSION_MISMATCH"
     assert res["target_score"] is None
+
+
+# ============================================================================
+# SAMPLE-COUNT SAFEGUARD UPDATES
+# ============================================================================
+
+def test_sample_safeguards_defaults_greater_than_one():
+    """Verify default minimum sample counts are strictly greater than one."""
+    cfg = ScoringConfig()
+    assert cfg.min_calibration_samples_per_location == 5
+    assert cfg.min_calibration_unknown_samples == 10
+    assert cfg.min_test_samples_per_location == 5
+    assert cfg.min_test_unknown_samples == 10
+
+    assert cfg.min_calibration_samples_per_location > 1
+    assert cfg.min_calibration_unknown_samples > 1
+    assert cfg.min_test_samples_per_location > 1
+    assert cfg.min_test_unknown_samples > 1
+
+    # Verify constant exports
+    assert DEFAULT_MIN_CALIBRATION_SAMPLES_PER_LOCATION == 5
+    assert DEFAULT_MIN_CALIBRATION_UNKNOWN_SAMPLES == 10
+    assert DEFAULT_MIN_TEST_SAMPLES_PER_LOCATION == 5
+    assert DEFAULT_MIN_TEST_UNKNOWN_SAMPLES == 10
+
+
+def test_exactly_one_calibration_image_per_category_fails_adequacy(mock_reference_store: ReferenceEmbeddingsStore):
+    """Exactly one calibration image per location and one unknown image must fail adequacy."""
+    single_counts = {loc: 1 for loc in mock_reference_store.locations}
+    single_counts["unknown"] = 1
+
+    # Call with default safeguard minimums (5 per location, 10 unknown)
+    is_adequate, missing = check_calibration_data_adequacy(
+        store=mock_reference_store,
+        sample_counts=single_counts,
+    )
+
+    assert is_adequate is False
+    # All hunt locations and unknown must be flagged as inadequate
+    assert len(missing) == len(mock_reference_store.locations) + 1
+    for loc in mock_reference_store.locations:
+        assert any(f"{loc} (count=1 < 5)" in m for m in missing)
+    assert any("unknown (count=1 < 10)" in m for m in missing)
+
+
+def test_exactly_one_test_image_per_category_not_marked_as_completed(
+    tmp_path: Path, monkeypatch, mock_reference_store: ReferenceEmbeddingsStore
+):
+    """Exactly one test image per location and one unknown image must not be marked as completed."""
+    # 1. Pure check
+    single_counts = {loc: 1 for loc in mock_reference_store.locations}
+    single_counts["unknown"] = 1
+
+    is_complete, missing = check_split_data_adequacy(
+        store=mock_reference_store,
+        sample_counts=single_counts,
+        min_samples_per_location=5,
+        min_unknown_samples=10,
+    )
+    assert is_complete is False
+    assert len(missing) == len(mock_reference_store.locations) + 1
+
+    # 2. Integration check with run_calibration
+    calib_dir = tmp_path / "calib"
+    test_dir = tmp_path / "test"
+    out_cfg = tmp_path / "out.json"
+    npz_path = tmp_path / "emb.npz"
+    meta_path = tmp_path / "meta.json"
+
+    dim = 64
+    ReferenceEmbeddingsStore.save(
+        npz_path=npz_path,
+        metadata_path=meta_path,
+        embeddings_by_location={"loc_a": np.ones((1, dim), dtype=np.float32)},
+        model_name="ViT-B-32",
+        pretrained="mock_test",
+    )
+    # Adequate calibration (5 per location, 10 unknown)
+    populate_split(calib_dir, {"loc_a": 5, "unknown": 10})
+    # Single image in test split (1 per location, 1 unknown)
+    populate_split(test_dir, {"loc_a": 1, "unknown": 1})
+
+    mock_emb = MockEmbedder(dimension=dim)
+    monkeypatch.setattr("campus_hunt_cv.cli.calibrate.OpenCLIPLocationEmbedder", lambda config: mock_emb)
+
+    base_cfg = CampusHuntConfig(
+        model=ModelConfig(model_name="ViT-B-32", pretrained="mock_test", device="cpu"),
+    )
+    success = run_calibration(
+        calibration_dir=calib_dir,
+        test_dir=test_dir,
+        embeddings_npz=npz_path,
+        metadata_json=meta_path,
+        output_config=out_cfg,
+        max_far=1.0,
+        min_unknown_rejection=0.0,
+        base_config=base_cfg,
+    )
+    assert success is True
+    loaded = CampusHuntConfig.from_json_file(out_cfg)
+
+    # Must NOT be completed; must be incomplete with metrics=None
+    assert loaded.calibration_metadata.test_evaluation.status == "incomplete"
+    assert loaded.calibration_metadata.test_evaluation.status != "completed"
+    assert loaded.calibration_metadata.test_evaluation.metrics is None
+    assert loaded.calibration_metadata.test_evaluation.missing_categories is not None
+    assert any("loc_a (count=1 < 5)" in m for m in loaded.calibration_metadata.test_evaluation.missing_categories)
+    assert any("unknown (count=1 < 10)" in m for m in loaded.calibration_metadata.test_evaluation.missing_categories)
+
+
+def test_meeting_configured_minimums_allows_evaluation_to_proceed(tmp_path: Path, monkeypatch):
+    """Meeting the configured minimums allows calibration and independent test evaluation to complete."""
+    calib_dir = tmp_path / "calib"
+    test_dir = tmp_path / "test"
+    out_cfg = tmp_path / "out.json"
+    npz_path = tmp_path / "emb.npz"
+    meta_path = tmp_path / "meta.json"
+
+    dim = 64
+    ReferenceEmbeddingsStore.save(
+        npz_path=npz_path,
+        metadata_path=meta_path,
+        embeddings_by_location={"loc_a": np.ones((1, dim), dtype=np.float32)},
+        model_name="ViT-B-32",
+        pretrained="mock_test",
+    )
+    # Meet default minimums: 5 for loc_a, 10 for unknown
+    populate_split(calib_dir, {"loc_a": 5, "unknown": 10})
+    populate_split(test_dir, {"loc_a": 5, "unknown": 10})
+
+    mock_emb = MockEmbedder(dimension=dim)
+    monkeypatch.setattr("campus_hunt_cv.cli.calibrate.OpenCLIPLocationEmbedder", lambda config: mock_emb)
+
+    base_cfg = CampusHuntConfig(
+        model=ModelConfig(model_name="ViT-B-32", pretrained="mock_test", device="cpu"),
+    )
+    success = run_calibration(
+        calibration_dir=calib_dir,
+        test_dir=test_dir,
+        embeddings_npz=npz_path,
+        metadata_json=meta_path,
+        output_config=out_cfg,
+        max_far=1.0,
+        min_unknown_rejection=0.0,
+        base_config=base_cfg,
+    )
+    assert success is True
+    loaded = CampusHuntConfig.from_json_file(out_cfg)
+
+    # Calibration is standard (calibrated, not provisional)
+    assert loaded.calibration_metadata.status == "calibrated"
+    assert loaded.calibration_metadata.is_provisional is False
+    assert loaded.calibration_metadata.warning is None
+
+    # Test evaluation completed cleanly
+    assert loaded.calibration_metadata.test_evaluation.status == "completed"
+    assert loaded.calibration_metadata.test_evaluation.is_provisional is False
+    assert loaded.calibration_metadata.test_evaluation.metrics is not None
+    assert loaded.calibration_metadata.test_evaluation.missing_categories is None
+
+
+def test_manually_lowering_minimum_produces_warning_and_provisional_status(tmp_path: Path, monkeypatch, caplog):
+    """Manually lowering sample minimums produces a prominent warning and marks statuses as provisional."""
+    calib_dir = tmp_path / "calib"
+    test_dir = tmp_path / "test"
+    out_cfg = tmp_path / "provisional_out.json"
+    npz_path = tmp_path / "emb.npz"
+    meta_path = tmp_path / "meta.json"
+
+    dim = 64
+    ReferenceEmbeddingsStore.save(
+        npz_path=npz_path,
+        metadata_path=meta_path,
+        embeddings_by_location={"loc_a": np.ones((1, dim), dtype=np.float32)},
+        model_name="ViT-B-32",
+        pretrained="mock_test",
+    )
+    # Populate only 1 image per location and 1 unknown image
+    populate_split(calib_dir, {"loc_a": 1, "unknown": 1})
+    populate_split(test_dir, {"loc_a": 1, "unknown": 1})
+
+    mock_emb = MockEmbedder(dimension=dim)
+    monkeypatch.setattr("campus_hunt_cv.cli.calibrate.OpenCLIPLocationEmbedder", lambda config: mock_emb)
+
+    base_cfg = CampusHuntConfig(
+        model=ModelConfig(model_name="ViT-B-32", pretrained="mock_test", device="cpu"),
+    )
+
+    with caplog.at_level("WARNING"):
+        success = run_calibration(
+            calibration_dir=calib_dir,
+            test_dir=test_dir,
+            embeddings_npz=npz_path,
+            metadata_json=meta_path,
+            output_config=out_cfg,
+            max_far=1.0,
+            min_unknown_rejection=0.0,
+            min_calib_samples_per_location=1,  # Manually lowered
+            min_calib_unknown_samples=1,       # Manually lowered
+            min_test_samples_per_location=1,   # Manually lowered
+            min_test_unknown_samples=1,        # Manually lowered
+            base_config=base_cfg,
+        )
+
+    assert success is True
+    # Verify prominent warnings were logged
+    assert any("PROVISIONAL CALIBRATION WARNING" in record.message for record in caplog.records)
+    assert any("PROVISIONAL TEST SPLIT WARNING" in record.message for record in caplog.records)
+
+    loaded = CampusHuntConfig.from_json_file(out_cfg)
+
+    # Calibration status is marked as provisional rather than verified
+    assert loaded.calibration_metadata.status == "provisional"
+    assert loaded.calibration_metadata.is_provisional is True
+    assert loaded.calibration_metadata.warning is not None
+    assert "below project standards" in loaded.calibration_metadata.warning
+
+    # Minimums used are recorded
+    assert loaded.calibration_metadata.minimums_used == {
+        "min_calibration_samples_per_location": 1,
+        "min_calibration_unknown_samples": 1,
+        "min_test_samples_per_location": 1,
+        "min_test_unknown_samples": 1,
+    }
+
+    # Test evaluation status is provisional
+    assert loaded.calibration_metadata.test_evaluation.status == "provisional"
+    assert loaded.calibration_metadata.test_evaluation.is_provisional is True
+    assert loaded.calibration_metadata.test_evaluation.minimums_used == {
+        "min_test_samples_per_location": 1,
+        "min_test_unknown_samples": 1,
+    }
+    assert loaded.calibration_metadata.test_evaluation.metrics is not None
+
+
+def test_inadequate_calibration_does_not_create_or_overwrite_active_config(tmp_path: Path, monkeypatch):
+    """Inadequate calibration data must not create a config or overwrite an existing active config."""
+    calib_dir = tmp_path / "calib"
+    test_dir = tmp_path / "test"
+    existing_cfg_path = tmp_path / "active_calibrated.json"
+    npz_path = tmp_path / "emb.npz"
+    meta_path = tmp_path / "meta.json"
+
+    # Write pre-existing valid active config
+    sentinel_text = json.dumps({"active_status": "production_ready", "version": 1})
+    existing_cfg_path.write_text(sentinel_text, encoding="utf-8")
+
+    dim = 64
+    ReferenceEmbeddingsStore.save(
+        npz_path=npz_path,
+        metadata_path=meta_path,
+        embeddings_by_location={"loc_a": np.ones((1, dim), dtype=np.float32)},
+        model_name="ViT-B-32",
+        pretrained="mock_test",
+    )
+    # Inadequate calibration data (only 1 image under default 5 and 10 minimums)
+    populate_split(calib_dir, {"loc_a": 1, "unknown": 1})
+
+    mock_emb = MockEmbedder(dimension=dim)
+    monkeypatch.setattr("campus_hunt_cv.cli.calibrate.OpenCLIPLocationEmbedder", lambda config: mock_emb)
+
+    base_cfg = CampusHuntConfig(
+        model=ModelConfig(model_name="ViT-B-32", pretrained="mock_test", device="cpu"),
+    )
+    success = run_calibration(
+        calibration_dir=calib_dir,
+        test_dir=test_dir,
+        embeddings_npz=npz_path,
+        metadata_json=meta_path,
+        output_config=existing_cfg_path,
+        base_config=base_cfg,
+    )
+
+    # 1. Calibration routine returns False
+    assert success is False
+    # 2. Pre-existing file is completely unchanged
+    assert existing_cfg_path.read_text(encoding="utf-8") == sentinel_text
+
+    # 3. If file did not exist, no new file is created
+    non_existent_path = tmp_path / "should_not_exist.json"
+    success2 = run_calibration(
+        calibration_dir=calib_dir,
+        test_dir=test_dir,
+        embeddings_npz=npz_path,
+        metadata_json=meta_path,
+        output_config=non_existent_path,
+        base_config=base_cfg,
+    )
+    assert success2 is False
+    assert not non_existent_path.exists()
+

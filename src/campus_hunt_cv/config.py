@@ -9,6 +9,12 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 from pydantic import BaseModel, ConfigDict, Field
 
 
+DEFAULT_MIN_CALIBRATION_SAMPLES_PER_LOCATION = 5
+DEFAULT_MIN_CALIBRATION_UNKNOWN_SAMPLES = 10
+DEFAULT_MIN_TEST_SAMPLES_PER_LOCATION = 5
+DEFAULT_MIN_TEST_UNKNOWN_SAMPLES = 10
+
+
 class ImageLimitsConfig(BaseModel):
     """Limits and security constraints for image ingestion."""
 
@@ -114,22 +120,22 @@ class ScoringConfig(BaseModel):
         ge=1,
     )
     min_calibration_samples_per_location: int = Field(
-        default=1,
+        default=DEFAULT_MIN_CALIBRATION_SAMPLES_PER_LOCATION,
         description="Minimum calibration captures per location required to run calibration (data-quality safeguard).",
         ge=1,
     )
     min_calibration_unknown_samples: int = Field(
-        default=1,
+        default=DEFAULT_MIN_CALIBRATION_UNKNOWN_SAMPLES,
         description="Minimum unknown/distractor captures required for calibration.",
         ge=1,
     )
     min_test_samples_per_location: int = Field(
-        default=1,
+        default=DEFAULT_MIN_TEST_SAMPLES_PER_LOCATION,
         description="Minimum hold-out test captures per location required for complete evaluation.",
         ge=1,
     )
     min_test_unknown_samples: int = Field(
-        default=1,
+        default=DEFAULT_MIN_TEST_UNKNOWN_SAMPLES,
         description="Minimum unknown/distractor hold-out test captures required for complete evaluation.",
         ge=1,
     )
@@ -200,10 +206,12 @@ class TestEvaluationMetrics(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    status: Literal["completed", "incomplete", "unavailable"]
+    status: Literal["completed", "incomplete", "unavailable", "provisional"]
     reason: Optional[str] = None
     sample_counts: Optional[Dict[str, int]] = None
     missing_categories: Optional[List[str]] = None
+    minimums_used: Optional[Dict[str, int]] = None
+    is_provisional: bool = False
     metrics: Optional[CalibrationMetrics] = None
 
 
@@ -212,6 +220,10 @@ class CalibrationMetadata(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    status: Literal["calibrated", "provisional"] = "calibrated"
+    is_provisional: bool = False
+    warning: Optional[str] = None
+    minimums_used: Optional[Dict[str, int]] = None
     model_version: str
     calibrated_at: str
     calibration_sample_counts: Dict[str, int]
@@ -255,6 +267,14 @@ class CampusHuntConfig(BaseModel):
             cfg.scoring.target_max_far = float(os.environ["CAMPUS_HUNT_TARGET_MAX_FAR"])
         if "CAMPUS_HUNT_TARGET_MIN_UNKNOWN_REJECTION" in os.environ:
             cfg.scoring.target_min_unknown_rejection = float(os.environ["CAMPUS_HUNT_TARGET_MIN_UNKNOWN_REJECTION"])
+        if "CAMPUS_HUNT_MIN_CALIB_SAMPLES" in os.environ:
+            cfg.scoring.min_calibration_samples_per_location = int(os.environ["CAMPUS_HUNT_MIN_CALIB_SAMPLES"])
+        if "CAMPUS_HUNT_MIN_CALIB_UNKNOWN" in os.environ:
+            cfg.scoring.min_calibration_unknown_samples = int(os.environ["CAMPUS_HUNT_MIN_CALIB_UNKNOWN"])
+        if "CAMPUS_HUNT_MIN_TEST_SAMPLES" in os.environ:
+            cfg.scoring.min_test_samples_per_location = int(os.environ["CAMPUS_HUNT_MIN_TEST_SAMPLES"])
+        if "CAMPUS_HUNT_MIN_TEST_UNKNOWN" in os.environ:
+            cfg.scoring.min_test_unknown_samples = int(os.environ["CAMPUS_HUNT_MIN_TEST_UNKNOWN"])
         if "CAMPUS_HUNT_EMBEDDINGS_PATH" in os.environ:
             cfg.storage.embeddings_path = Path(os.environ["CAMPUS_HUNT_EMBEDDINGS_PATH"])
         if "CAMPUS_HUNT_METADATA_PATH" in os.environ:
