@@ -247,7 +247,8 @@ The configuration file written by `campus-hunt-calibrate` uses a nested structur
     "match_threshold": 0.65,
     "margin_threshold": 0.08,
     "mismatch_threshold": null,
-    "min_reference_images_per_location": 1
+    "min_reference_images_per_location": 1,
+    "allow_unvalidated_auto_accept": false
   },
   "storage": {
     "reference_data_dir": "data/reference",
@@ -310,8 +311,33 @@ The configuration file written by `campus-hunt-calibrate` uses a nested structur
 1. **Uncalibrated Safety Gate**: If `calibrated` is `False` or thresholds are `None`, the verifier **always** returns `"ambiguous"` with `reason_code="UNCALIBRATED_THRESHOLDS"`. It will never guess or use arbitrary thresholds.
 2. **`strong_match`**: Requires `target_location_id == best_matching_location_id` **and** `target_score >= match_threshold` **and** `margin >= margin_threshold`.
 3. **`mismatch`**: Requires a competing location to decisively win (`best_matching_score >= match_threshold` and `best_matching_score - target_score >= margin_threshold`).
-4. **`ambiguous`**: All borderline scores, narrow margins, ties, insufficient reference photos, or uncalibrated states.
+4. **`ambiguous`**: All borderline scores, narrow margins, ties, insufficient reference photos, uncalibrated states, or unvalidated configurations.
 5. **Error Routing**: If image bytes are corrupted, model weights mismatch, or inference fails, the system returns `result="ambiguous"` with an `ERROR_...` reason code (e.g. `ERROR_IMAGE_TOO_LARGE_BYTES`, `ERROR_MODEL_VERSION_MISMATCH`). The backend can route this to manual staff review. **An AI error is never turned into an unfair player failure.**
+
+### Runtime Authorization Gate: Automatic Acceptance vs. Manual Review
+
+To guarantee competition integrity, matching thresholds alone is **not** sufficient to automatically unlock team progression. The runtime verifier checks the empirical validation provenance of the active configuration:
+
+| Calibration Status | Hold-Out Test Status | Matching Submission Outcome | Resulting `reason_code` | Action |
+|:---|:---|:---|:---|:---|
+| `calibrated` (standard) | `completed` | `strong_match` | `STRONG_MATCH` | Automatic progression |
+| `provisional` (lowered count) | Any (`completed`, `provisional`, etc.) | `ambiguous` | `PROVISIONAL_CALIBRATION_REQUIRES_REVIEW` | Queued for manual staff review |
+| Any | `unavailable` | `ambiguous` | `HOLDOUT_TEST_NOT_COMPLETED` | Queued for manual staff review |
+| Any | `incomplete` | `ambiguous` | `HOLDOUT_TEST_NOT_COMPLETED` | Queued for manual staff review |
+| Any | `provisional` | `ambiguous` | `HOLDOUT_TEST_NOT_COMPLETED` | Queued for manual staff review |
+| Missing / legacy metadata | Missing | `ambiguous` | `HOLDOUT_TEST_NOT_COMPLETED` | Queued for manual staff review |
+
+> [!NOTE]
+> When a submission is routed to manual review due to provisional or uncompleted hold-out status, **all computed score fields are fully preserved** in the response dictionary (`target_score`, `margin`, `best_matching_location_id`, `best_competing_score`). This gives human adjudicators complete quantitative context to evaluate the photo immediately.
+
+#### Explicit Opt-In Override (`allow_unvalidated_auto_accept`)
+If automatic acceptance is explicitly required during local development or controlled dry-runs before independent hold-out test captures are collected, set:
+- In JSON config: `"scoring": { "allow_unvalidated_auto_accept": true }`
+- OR via environment variable: `CAMPUS_HUNT_ALLOW_UNVALIDATED_AUTO_ACCEPT=1`
+- OR CLI flag during calibration: `--allow-unvalidated-auto-accept`
+
+> [!CAUTION]
+> `allow_unvalidated_auto_accept` defaults strictly to `false`. It bypasses the hold-out test safety gate and should **never** be enabled in production or on competition day.
 
 ---
 

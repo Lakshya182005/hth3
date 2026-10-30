@@ -127,7 +127,12 @@ def mock_reference_store() -> ReferenceEmbeddingsStore:
 
 @pytest.fixture
 def calibrated_config() -> CampusHuntConfig:
-    """Config with calibrated thresholds set."""
+    """Config with fully calibrated thresholds and completed hold-out test evaluation."""
+    from campus_hunt_cv.config import (
+        CalibrationMetadata,
+        CalibrationMetrics,
+        TestEvaluationMetrics,
+    )
     cfg = CampusHuntConfig()
     cfg.scoring = ScoringConfig(
         calibrated=True,
@@ -135,6 +140,27 @@ def calibrated_config() -> CampusHuntConfig:
         margin_threshold=0.08,
         mismatch_threshold=0.30,
         top_k=3,
+    )
+    cfg.calibration_metadata = CalibrationMetadata(
+        status="calibrated",
+        is_provisional=False,
+        model_version="ViT-B-32/mock_test_weights",
+        calibrated_at="2026-10-30T12:00:00Z",
+        calibration_sample_counts={"clock_tower": 5, "library_atrium": 5, "unknown": 10},
+        calibration_metrics=CalibrationMetrics(
+            correct_accept_rate=0.95,
+            wrong_false_accept_rate=0.01,
+            unknown_rejection_rate=0.98,
+        ),
+        test_evaluation=TestEvaluationMetrics(
+            status="completed",
+            is_provisional=False,
+            metrics=CalibrationMetrics(
+                correct_accept_rate=0.94,
+                wrong_false_accept_rate=0.01,
+                unknown_rejection_rate=0.97,
+            ),
+        ),
     )
     return cfg
 

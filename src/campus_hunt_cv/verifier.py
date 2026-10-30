@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Tuple, Union
 from pydantic import BaseModel, Field
 
 from campus_hunt_cv.config import CampusHuntConfig
@@ -58,6 +58,40 @@ class VerificationResponse(BaseModel):
     model_version: str = Field(
         description="Identifying model architecture and checkpoint string."
     )
+
+
+def check_config_validation_status(config: CampusHuntConfig) -> Tuple[bool, Optional[str]]:
+    """Verify whether a configuration is authorized for automatic 'strong_match' progression.
+
+    Rules:
+    1. Explicit Opt-In: If config.scoring.allow_unvalidated_auto_accept is True,
+       automatic acceptance is permitted (intended strictly for development/controlled testing).
+    2. Missing Metadata: If config.calibration_metadata is None, calibration provenance
+       and hold-out test completion cannot be verified. Fails safe to 'HOLDOUT_TEST_NOT_COMPLETED'.
+    3. Provisional Calibration: If config.calibration_metadata.status == 'provisional'
+       or config.calibration_metadata.is_provisional is True, sample safeguards were lowered
+       below project standards. Fails safe to 'PROVISIONAL_CALIBRATION_REQUIRES_REVIEW'.
+    4. Incomplete/Unavailable/Provisional Hold-Out Evaluation: If test_evaluation is missing, or its
+       status is not 'completed', or is_provisional is True, independent hold-out test evaluation
+       did not verify generalizability. Fails safe to 'HOLDOUT_TEST_NOT_COMPLETED'.
+    5. Fully Validated: Both calibration and hold-out test splits met all quality standards
+       without provisional overrides. Returns (True, None).
+    """
+    if config.scoring.allow_unvalidated_auto_accept:
+        return True, None
+
+    meta = config.calibration_metadata
+    if meta is None:
+        return False, "HOLDOUT_TEST_NOT_COMPLETED"
+
+    if meta.status == "provisional" or meta.is_provisional:
+        return False, "PROVISIONAL_CALIBRATION_REQUIRES_REVIEW"
+
+    test_eval = meta.test_evaluation
+    if test_eval is None or test_eval.status != "completed" or test_eval.is_provisional:
+        return False, "HOLDOUT_TEST_NOT_COMPLETED"
+
+    return True, None
 
 
 class LocationVerifier:
@@ -269,6 +303,21 @@ class LocationVerifier:
             margin=margin,
             target_ref_count=target_ref_count,
         )
+
+        # 7. Runtime safety gate: provisional calibration or incomplete hold-out test
+        # must never produce an automatic strong_match unless explicitly opted in.
+        if result == "strong_match":
+            is_validated, rejection_reason = check_config_validation_status(self.config)
+            if not is_validated:
+                logger.warning(
+                    "Downgrading strong_match to ambiguous for target '%s': %s (target_score=%.3f, margin=%.3f)",
+                    target_location_id,
+                    rejection_reason,
+                    target_score if target_score is not None else 0.0,
+                    margin if margin is not None else 0.0,
+                )
+                result = "ambiguous"
+                reason_code = rejection_reason or "HOLDOUT_TEST_NOT_COMPLETED"
 
         return VerificationResponse(
             result=result,

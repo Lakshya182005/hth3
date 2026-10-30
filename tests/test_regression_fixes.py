@@ -16,6 +16,8 @@ from campus_hunt_cv.cli.calibrate import (
     run_calibration,
 )
 from campus_hunt_cv.config import (
+    CalibrationMetadata,
+    CalibrationMetrics,
     CampusHuntConfig,
     DEFAULT_MIN_CALIBRATION_SAMPLES_PER_LOCATION,
     DEFAULT_MIN_CALIBRATION_UNKNOWN_SAMPLES,
@@ -23,7 +25,11 @@ from campus_hunt_cv.config import (
     DEFAULT_MIN_TEST_UNKNOWN_SAMPLES,
     ModelConfig,
     ScoringConfig,
+    TestEvaluationMetrics,
 )
+
+# Tell pytest not to treat TestEvaluationMetrics as a pytest test suite class
+TestEvaluationMetrics.__test__ = False
 from campus_hunt_cv.decision import DecisionEngine
 from campus_hunt_cv.embeddings_store import ReferenceEmbeddingsStore
 from campus_hunt_cv.exceptions import ReferenceDataError
@@ -101,11 +107,21 @@ def test_fix1_calibration_config_roundtrip(tmp_path: Path, mock_reference_store:
                 "unknown_rejections": 10,
             },
             "test_evaluation": {
-                "status": "unavailable",
-                "reason": "No test captures found in data/test/",
-                "sample_counts": {},
-                "missing_categories": ["clock_tower (count=0 < 1)", "unknown (count=0 < 1)"],
-                "metrics": None,
+                "status": "completed",
+                "reason": None,
+                "sample_counts": {"clock_tower": 5, "unknown": 10},
+                "missing_categories": None,
+                "metrics": {
+                    "correct_accept_rate": 0.94,
+                    "wrong_false_accept_rate": 0.01,
+                    "unknown_rejection_rate": 0.97,
+                    "correct_trials": 20,
+                    "correct_accepts": 19,
+                    "wrong_trials": 40,
+                    "wrong_false_accepts": 0,
+                    "unknown_trials": 10,
+                    "unknown_rejections": 10,
+                },
             },
         },
     }
@@ -951,4 +967,254 @@ def test_inadequate_calibration_does_not_create_or_overwrite_active_config(tmp_p
     )
     assert success2 is False
     assert not non_existent_path.exists()
+
+
+# ============================================================================
+# RUNTIME HANDLING OF PROVISIONAL & UNVALIDATED CONFIGS
+# ============================================================================
+
+def test_provisional_calibration_cannot_auto_accept_by_default(mock_reference_store: ReferenceEmbeddingsStore):
+    """Provisional calibration must fail safe to ambiguous with PROVISIONAL_CALIBRATION_REQUIRES_REVIEW."""
+    clock_ref = mock_reference_store.get_location_embeddings("clock_tower")[0]
+
+    class ControlledEmbedder(MockEmbedder):
+        def embed_image(self, image):
+            return clock_ref.copy()
+
+    cfg = CampusHuntConfig()
+    cfg.scoring = ScoringConfig(
+        calibrated=True,
+        match_threshold=0.60,
+        margin_threshold=0.08,
+        allow_unvalidated_auto_accept=False,
+    )
+    cfg.calibration_metadata = CalibrationMetadata(
+        status="provisional",
+        is_provisional=True,
+        warning="Lowered safeguards",
+        model_version="ViT-B-32/mock_test_weights",
+        calibrated_at="2026-10-30T12:00:00Z",
+        calibration_sample_counts={"clock_tower": 2, "unknown": 2},
+        calibration_metrics=CalibrationMetrics(
+            correct_accept_rate=0.95,
+            wrong_false_accept_rate=0.01,
+            unknown_rejection_rate=0.98,
+        ),
+        test_evaluation=TestEvaluationMetrics(
+            status="completed",
+            is_provisional=False,
+            metrics=CalibrationMetrics(
+                correct_accept_rate=0.94,
+                wrong_false_accept_rate=0.01,
+                unknown_rejection_rate=0.97,
+            ),
+        ),
+    )
+
+    verifier = LocationVerifier(
+        config=cfg,
+        embedder=ControlledEmbedder(dimension=64),
+        store=mock_reference_store,
+    )
+
+    image_bytes = create_test_image_bytes()
+    result = verifier.verify(image_bytes=image_bytes, target_location_id="clock_tower")
+
+    # Score fields are computed and preserved
+    assert result["target_score"] is not None
+    assert result["target_score"] >= 0.60
+    assert result["margin"] is not None
+    assert result["margin"] >= 0.08
+    assert result["best_matching_location_id"] == "clock_tower"
+
+    # Verdict must be ambiguous with clear review code (never strong_match)
+    assert result["result"] == "ambiguous"
+    assert result["reason_code"] == "PROVISIONAL_CALIBRATION_REQUIRES_REVIEW"
+
+
+def test_unavailable_incomplete_or_provisional_holdout_cannot_auto_accept(mock_reference_store: ReferenceEmbeddingsStore):
+    """Unavailable, incomplete, provisional hold-out, or missing metadata must fail safe to HOLDOUT_TEST_NOT_COMPLETED."""
+    clock_ref = mock_reference_store.get_location_embeddings("clock_tower")[0]
+
+    class ControlledEmbedder(MockEmbedder):
+        def embed_image(self, image):
+            return clock_ref.copy()
+
+    image_bytes = create_test_image_bytes()
+
+    # Sub-case A: test_evaluation.status == 'unavailable'
+    cfg_unavail = CampusHuntConfig()
+    cfg_unavail.scoring = ScoringConfig(calibrated=True, match_threshold=0.60, margin_threshold=0.08)
+    cfg_unavail.calibration_metadata = CalibrationMetadata(
+        status="calibrated",
+        is_provisional=False,
+        model_version="ViT-B-32/mock_test_weights",
+        calibrated_at="2026-10-30T12:00:00Z",
+        calibration_sample_counts={"clock_tower": 5, "unknown": 10},
+        calibration_metrics=CalibrationMetrics(
+            correct_accept_rate=0.95, wrong_false_accept_rate=0.01, unknown_rejection_rate=0.98
+        ),
+        test_evaluation=TestEvaluationMetrics(status="unavailable", reason="No test photos", metrics=None),
+    )
+    v_unavail = LocationVerifier(config=cfg_unavail, embedder=ControlledEmbedder(dimension=64), store=mock_reference_store)
+    res_a = v_unavail.verify(image_bytes, "clock_tower")
+    assert res_a["result"] == "ambiguous"
+    assert res_a["reason_code"] == "HOLDOUT_TEST_NOT_COMPLETED"
+    assert res_a["target_score"] >= 0.60
+
+    # Sub-case B: test_evaluation.status == 'incomplete'
+    cfg_incomp = CampusHuntConfig()
+    cfg_incomp.scoring = ScoringConfig(calibrated=True, match_threshold=0.60, margin_threshold=0.08)
+    cfg_incomp.calibration_metadata = CalibrationMetadata(
+        status="calibrated",
+        is_provisional=False,
+        model_version="ViT-B-32/mock_test_weights",
+        calibrated_at="2026-10-30T12:00:00Z",
+        calibration_sample_counts={"clock_tower": 5, "unknown": 10},
+        calibration_metrics=CalibrationMetrics(
+            correct_accept_rate=0.95, wrong_false_accept_rate=0.01, unknown_rejection_rate=0.98
+        ),
+        test_evaluation=TestEvaluationMetrics(
+            status="incomplete",
+            reason="Missing categories",
+            missing_categories=["unknown (count=0 < 10)"],
+            metrics=None,
+        ),
+    )
+    v_incomp = LocationVerifier(config=cfg_incomp, embedder=ControlledEmbedder(dimension=64), store=mock_reference_store)
+    res_b = v_incomp.verify(image_bytes, "clock_tower")
+    assert res_b["result"] == "ambiguous"
+    assert res_b["reason_code"] == "HOLDOUT_TEST_NOT_COMPLETED"
+    assert res_b["target_score"] >= 0.60
+
+    # Sub-case C: test_evaluation.status == 'provisional'
+    cfg_prov_test = CampusHuntConfig()
+    cfg_prov_test.scoring = ScoringConfig(calibrated=True, match_threshold=0.60, margin_threshold=0.08)
+    cfg_prov_test.calibration_metadata = CalibrationMetadata(
+        status="calibrated",
+        is_provisional=False,
+        model_version="ViT-B-32/mock_test_weights",
+        calibrated_at="2026-10-30T12:00:00Z",
+        calibration_sample_counts={"clock_tower": 5, "unknown": 10},
+        calibration_metrics=CalibrationMetrics(
+            correct_accept_rate=0.95, wrong_false_accept_rate=0.01, unknown_rejection_rate=0.98
+        ),
+        test_evaluation=TestEvaluationMetrics(
+            status="provisional",
+            is_provisional=True,
+            metrics=CalibrationMetrics(correct_accept_rate=0.94, wrong_false_accept_rate=0.01, unknown_rejection_rate=0.97),
+        ),
+    )
+    v_prov_test = LocationVerifier(config=cfg_prov_test, embedder=ControlledEmbedder(dimension=64), store=mock_reference_store)
+    res_c = v_prov_test.verify(image_bytes, "clock_tower")
+    assert res_c["result"] == "ambiguous"
+    assert res_c["reason_code"] == "HOLDOUT_TEST_NOT_COMPLETED"
+    assert res_c["target_score"] >= 0.60
+
+    # Sub-case D: calibration_metadata is None (legacy or unvalidated)
+    cfg_no_meta = CampusHuntConfig()
+    cfg_no_meta.scoring = ScoringConfig(calibrated=True, match_threshold=0.60, margin_threshold=0.08)
+    cfg_no_meta.calibration_metadata = None
+    v_no_meta = LocationVerifier(config=cfg_no_meta, embedder=ControlledEmbedder(dimension=64), store=mock_reference_store)
+    res_d = v_no_meta.verify(image_bytes, "clock_tower")
+    assert res_d["result"] == "ambiguous"
+    assert res_d["reason_code"] == "HOLDOUT_TEST_NOT_COMPLETED"
+    assert res_d["target_score"] >= 0.60
+
+
+def test_fully_calibrated_completed_holdout_produces_strong_match(mock_reference_store: ReferenceEmbeddingsStore):
+    """Fully calibrated config with completed hold-out test evaluation produces strong_match."""
+    clock_ref = mock_reference_store.get_location_embeddings("clock_tower")[0]
+
+    class ControlledEmbedder(MockEmbedder):
+        def embed_image(self, image):
+            return clock_ref.copy()
+
+    cfg = CampusHuntConfig()
+    cfg.scoring = ScoringConfig(
+        calibrated=True,
+        match_threshold=0.60,
+        margin_threshold=0.08,
+        allow_unvalidated_auto_accept=False,
+    )
+    cfg.calibration_metadata = CalibrationMetadata(
+        status="calibrated",
+        is_provisional=False,
+        model_version="ViT-B-32/mock_test_weights",
+        calibrated_at="2026-10-30T12:00:00Z",
+        calibration_sample_counts={"clock_tower": 5, "library_atrium": 5, "unknown": 10},
+        calibration_metrics=CalibrationMetrics(
+            correct_accept_rate=0.95,
+            wrong_false_accept_rate=0.01,
+            unknown_rejection_rate=0.98,
+        ),
+        test_evaluation=TestEvaluationMetrics(
+            status="completed",
+            is_provisional=False,
+            metrics=CalibrationMetrics(
+                correct_accept_rate=0.94,
+                wrong_false_accept_rate=0.01,
+                unknown_rejection_rate=0.97,
+            ),
+        ),
+    )
+
+    verifier = LocationVerifier(
+        config=cfg,
+        embedder=ControlledEmbedder(dimension=64),
+        store=mock_reference_store,
+    )
+
+    image_bytes = create_test_image_bytes()
+    result = verifier.verify(image_bytes=image_bytes, target_location_id="clock_tower")
+
+    assert result["result"] == "strong_match"
+    assert result["reason_code"] == "STRONG_MATCH"
+    assert result["best_matching_location_id"] == "clock_tower"
+    assert result["target_score"] >= 0.60
+    assert result["margin"] >= 0.08
+
+
+def test_explicit_opt_in_allows_unvalidated_auto_accept(mock_reference_store: ReferenceEmbeddingsStore):
+    """Setting allow_unvalidated_auto_accept=True permits strong_match even when unvalidated or provisional."""
+    clock_ref = mock_reference_store.get_location_embeddings("clock_tower")[0]
+
+    class ControlledEmbedder(MockEmbedder):
+        def embed_image(self, image):
+            return clock_ref.copy()
+
+    # Provisional calibration + unavailable test split, BUT explicit opt-in is enabled
+    cfg = CampusHuntConfig()
+    cfg.scoring = ScoringConfig(
+        calibrated=True,
+        match_threshold=0.60,
+        margin_threshold=0.08,
+        allow_unvalidated_auto_accept=True,  # Explicit opt-in
+    )
+    cfg.calibration_metadata = CalibrationMetadata(
+        status="provisional",
+        is_provisional=True,
+        warning="Lowered safeguards",
+        model_version="ViT-B-32/mock_test_weights",
+        calibrated_at="2026-10-30T12:00:00Z",
+        calibration_sample_counts={"clock_tower": 1, "unknown": 1},
+        calibration_metrics=CalibrationMetrics(
+            correct_accept_rate=0.95, wrong_false_accept_rate=0.01, unknown_rejection_rate=0.98
+        ),
+        test_evaluation=TestEvaluationMetrics(status="unavailable", metrics=None),
+    )
+
+    verifier = LocationVerifier(
+        config=cfg,
+        embedder=ControlledEmbedder(dimension=64),
+        store=mock_reference_store,
+    )
+
+    image_bytes = create_test_image_bytes()
+    result = verifier.verify(image_bytes=image_bytes, target_location_id="clock_tower")
+
+    # With opt-in enabled, strong_match is permitted
+    assert result["result"] == "strong_match"
+    assert result["reason_code"] == "STRONG_MATCH"
+
 

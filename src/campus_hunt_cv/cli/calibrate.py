@@ -772,6 +772,7 @@ def run_calibration(
                 min_test_unknown_samples=effective_min_test_unknown,
                 target_max_far=effective_max_far,
                 target_min_unknown_rejection=effective_min_unknown_rejection,
+                allow_unvalidated_auto_accept=cfg.scoring.allow_unvalidated_auto_accept,
             ),
             storage=StorageConfig(
                 reference_data_dir=cfg.storage.reference_data_dir,
@@ -904,8 +905,17 @@ def main() -> None:
         default=cfg.model.device,
         help="Compute device for image embedding (default: cpu)",
     )
+    parser.add_argument(
+        "--allow-unvalidated-auto-accept",
+        action="store_true",
+        default=False,
+        help="DANGER / DEVELOPMENT ONLY: Permit output config to auto-accept submissions even if provisional or test is incomplete",
+    )
 
     args = parser.parse_args()
+
+    if args.allow_unvalidated_auto_accept:
+        cfg.scoring.allow_unvalidated_auto_accept = True
 
     # Resolve calibration directory
     calib_dir = args.calibration_dir or args.validation_dir or cfg.storage.calibration_data_dir

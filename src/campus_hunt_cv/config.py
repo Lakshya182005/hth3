@@ -151,6 +151,14 @@ class ScoringConfig(BaseModel):
         ge=0.0,
         le=1.0,
     )
+    allow_unvalidated_auto_accept: bool = Field(
+        default=False,
+        description=(
+            "DANGER / DEVELOPMENT ONLY: If True, permits automatic 'strong_match' outcomes even when "
+            "calibration is provisional, hold-out test evaluation is unavailable or incomplete, or "
+            "calibration metadata is missing. Defaults to False. Must NEVER be enabled in production."
+        ),
+    )
 
 
 class StorageConfig(BaseModel):
@@ -267,6 +275,10 @@ class CampusHuntConfig(BaseModel):
             cfg.scoring.target_max_far = float(os.environ["CAMPUS_HUNT_TARGET_MAX_FAR"])
         if "CAMPUS_HUNT_TARGET_MIN_UNKNOWN_REJECTION" in os.environ:
             cfg.scoring.target_min_unknown_rejection = float(os.environ["CAMPUS_HUNT_TARGET_MIN_UNKNOWN_REJECTION"])
+        if "CAMPUS_HUNT_ALLOW_UNVALIDATED_AUTO_ACCEPT" in os.environ:
+            cfg.scoring.allow_unvalidated_auto_accept = (
+                os.environ["CAMPUS_HUNT_ALLOW_UNVALIDATED_AUTO_ACCEPT"].lower() in ("1", "true", "yes")
+            )
         if "CAMPUS_HUNT_MIN_CALIB_SAMPLES" in os.environ:
             cfg.scoring.min_calibration_samples_per_location = int(os.environ["CAMPUS_HUNT_MIN_CALIB_SAMPLES"])
         if "CAMPUS_HUNT_MIN_CALIB_UNKNOWN" in os.environ:
