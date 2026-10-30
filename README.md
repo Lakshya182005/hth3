@@ -51,6 +51,40 @@ data/
 3. **`unknown/` Distractors**: Contains photos of non-hunt areas (dining halls, hallways, random trees, generic doors). These are essential to calibrate the unknown-image rejection rate and prevent false acceptances of off-target photos.
 4. **No Fabricated Data**: This repository provides directory scaffolding and documentation only. Embeddings, calibrated thresholds, and performance metrics must be generated from real campus photos.
 
+### Dataset Integrity Audit (`campus-hunt-audit-data`)
+
+Before building embeddings or running threshold calibration, audit data splits to verify structural integrity, sample-count adequacy, image decodability, and strict split isolation:
+
+```bash
+# Audit default data splits (data/reference, data/calibration, data/test)
+campus-hunt-audit-data
+
+# Audit with custom paths, minimum sample safeguards, and write a structured JSON report
+campus-hunt-audit-data \
+  --reference-dir data/reference \
+  --calibration-dir data/calibration \
+  --test-dir data/test \
+  --min-reference-images 1 \
+  --min-calib-samples 5 \
+  --min-calib-unknown 10 \
+  --min-test-samples 5 \
+  --min-test-unknown 10 \
+  --output-report reports/dataset_audit.json
+```
+
+#### What `campus-hunt-audit-data` Checks:
+1. **Reference Split Completeness**: Every reference location folder contains valid image files and meets the configured reference-photo minimum (default: 1).
+2. **Location Alignment Across Splits**: Calibration and test splits must contain every location ID present in the reference split, plus the mandatory `unknown/` distractor directory. Unexpected location subdirectories are flagged.
+3. **Sample-Count Safeguards**: Every location category and `unknown/` folder must meet or exceed configured minimums (defaults: 5 per location in calibration/test, 10 in `unknown/`).
+4. **Image Decodability & Limit Enforcement**: Every image is decoded and validated against limits (max 15MB, min 32x32px, max 50M pixels, JPEG/PNG/WEBP). Empty, truncated, or corrupt files are reported with specific failure reasons.
+5. **Exact Duplicate Detection (SHA-256)**: Reusing the same image across reference, calibration, and test splits compromises hold-out evaluation. The audit computes SHA-256 hashes of all images and reports duplicate file paths across splits without copying or exposing image content. Reusing images across different locations within a split is also flagged.
+6. **Extraneous Content Detection**: Flags empty location folders, nested subdirectories, and unsupported non-image files (e.g. `.txt`, `.py`, `.csv`, `.bin`) inside location directories.
+
+#### Exit Codes & Limitations:
+- **Exit `0`**: All checks pass without issues.
+- **Exit `1`**: One or more required checks failed (missing location folders, insufficient counts, corrupt images, duplicates across splits).
+- **Audit Limitations**: The audit tool is purely structural and offline. It does **not** download model weights, perform neural network inference, measure accuracy, or claim the model is validated.
+
 ---
 
 ## 3. Installation & Setup
@@ -399,7 +433,7 @@ Fine-tuning is **only worth considering** if all of the following conditions are
 
 ## 12. Testing
 
-The test suite includes 57 fast, isolated offline unit and regression tests:
+The test suite includes 89 fast, isolated offline unit and regression tests:
 
 ```bash
 # Run unit and regression tests

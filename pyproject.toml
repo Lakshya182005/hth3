@@ -27,6 +27,7 @@ dev = [
 [project.scripts]
 campus-hunt-build-embeddings = "campus_hunt_cv.cli.build_embeddings:main"
 campus-hunt-calibrate = "campus_hunt_cv.cli.calibrate:main"
+campus-hunt-audit-data = "campus_hunt_cv.cli.audit_data:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
