@@ -133,18 +133,32 @@ campus-hunt-calibrate \
   --metadata-json data/reference_embeddings.meta.json \
   --output-config calibrated_thresholds.json \
   --max-far 0.02 \
+  --min-unknown-rejection 0.90 \
+  --min-calib-samples 1 \
+  --min-calib-unknown 1 \
+  --min-test-samples 1 \
+  --min-test-unknown 1 \
   --device cpu
 ```
 
-### Process Details:
+### Process Details & Safety Guarantees:
 1. **Calibration Split (`data/calibration/`)**:
    - Sweeps candidate match thresholds and margins.
    - Uses the **actual reference photo count** for each location from the embeddings store.
-   - Requires positive captures for all locations and distractor captures in `unknown/`. If calibration data is inadequate, the tool reports missing locations and **refuses to write an unvalidated calibrated config**.
-2. **Separate Hold-Out Test Split (`data/test/`)**:
-   - The selected thresholds are evaluated **once** on the independent test dataset.
-   - If `data/test/` is empty or has not been collected yet, the tool outputs an explicit notice that independent test evaluation is **unavailable**, and records `"status": "unavailable"` in the config metadata. Calibration metrics are never presented as test performance.
-3. **No Unmeasured Mismatch Threshold**:
+   - Checks data adequacy: requires valid captures for all locations in the reference embeddings and in `unknown/`. If calibration data is inadequate, the tool reports missing locations and **refuses to write an unvalidated calibrated config**.
+   - **Data Safeguard Note**: Minimum capture thresholds (e.g. 1–3 per class) are practical data-quality safeguards to prevent empty/broken evaluation runs—they do **not** constitute statistical proof of model reliability on campus.
+2. **Fail-Closed Calibration (No Satisfying Threshold)**:
+   - If no candidate threshold pair meets all configured safety constraints (e.g. `FAR <= max_far` and `unknown_rejection >= min_unknown_rejection`), calibration **fails closed**:
+     - It **does not** write or overwrite an active calibrated configuration (`scoring.calibrated=True`).
+     - If an existing configuration file is present at `--output-config`, it remains untouched.
+     - Files are written atomically on success.
+     - The CLI prints a diagnostic summary and exits with a non-zero exit code (`1`).
+     - An optional diagnostic report can be saved via `--diagnostic-report`, marked as `deployable: false, calibrated: false`.
+3. **Three-Outcome Hold-Out Test Split (`data/test/`)**:
+   - `unavailable`: No usable test captures in `data/test/`. Metrics are `null`, and missing categories are recorded.
+   - `incomplete`: Test captures exist, but some reference locations or `unknown/` are missing, or counts fall below minimum. Partial metrics are **not** presented as complete independent test performance (metrics are `null`), and missing categories are recorded with a clear message.
+   - `completed`: All required categories and sample counts are present. Selected thresholds are evaluated once to measure unbiased generalization performance.
+4. **No Unmeasured Mismatch Threshold**:
    - Calibration tunes `match_threshold` and `margin_threshold`. It does **not** insert an arbitrary, unvalidated `mismatch_threshold: 0.30`. `mismatch_threshold` defaults to `None`. Teams advance strictly on the conservative `strong_match` criteria.
 
 ---
@@ -253,7 +267,18 @@ The configuration file written by `campus-hunt-calibrate` uses a nested structur
     },
     "test_evaluation": {
       "status": "unavailable",
-      "reason": "No independent test captures found in data/test/"
+      "reason": "No independent test captures found in data/test/",
+      "sample_counts": {
+        "clock_tower": 0,
+        "library_atrium": 0,
+        "unknown": 0
+      },
+      "missing_categories": [
+        "clock_tower (count=0 < 1)",
+        "library_atrium (count=0 < 1)",
+        "unknown (count=0 < 1)"
+      ],
+      "metrics": null
     }
   }
 }

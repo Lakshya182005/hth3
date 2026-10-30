@@ -7,6 +7,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 import json
 import logging
+import os
 from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -275,21 +276,39 @@ def print_confusion_matrix(
     print("=" * 80 + "\n")
 
 
+def check_split_data_adequacy(
+    store: ReferenceEmbeddingsStore,
+    sample_counts: Dict[str, int],
+    min_samples_per_location: int = 1,
+    min_unknown_samples: int = 1,
+) -> Tuple[bool, List[str]]:
+    """Verify that split data contains sufficient samples across all hunt locations and unknown."""
+    missing: List[str] = []
+    for loc in store.locations:
+        count = sample_counts.get(loc, 0)
+        if count < min_samples_per_location:
+            missing.append(f"{loc} (count={count} < {min_samples_per_location})")
+
+    unknown_count = sample_counts.get("unknown", 0)
+    if unknown_count < min_unknown_samples:
+        missing.append(f"unknown (count={unknown_count} < {min_unknown_samples})")
+
+    return (len(missing) == 0, missing)
+
+
 def check_calibration_data_adequacy(
     store: ReferenceEmbeddingsStore,
     sample_counts: Dict[str, int],
     min_samples_per_location: int = 1,
+    min_unknown_samples: int = 1,
 ) -> Tuple[bool, List[str]]:
-    """Verify that calibration data contains sufficient samples across all hunt locations."""
-    missing: List[str] = []
-    for loc in store.locations:
-        if sample_counts.get(loc, 0) < min_samples_per_location:
-            missing.append(f"{loc} (count={sample_counts.get(loc, 0)})")
-
-    if sample_counts.get("unknown", 0) < 1:
-        missing.append("unknown (count=0)")
-
-    return (len(missing) == 0, missing)
+    """Backward-compatible wrapper for calibration adequacy check."""
+    return check_split_data_adequacy(
+        store=store,
+        sample_counts=sample_counts,
+        min_samples_per_location=min_samples_per_location,
+        min_unknown_samples=min_unknown_samples,
+    )
 
 
 def run_calibration(
@@ -298,13 +317,25 @@ def run_calibration(
     embeddings_npz: Path,
     metadata_json: Path,
     output_config: Optional[Path] = None,
+    diagnostic_report: Optional[Path] = None,
     candidate_match_thresholds: Optional[List[float]] = None,
     candidate_margins: Optional[List[float]] = None,
-    max_far: float = 0.02,
+    max_far: Optional[float] = None,
+    min_unknown_rejection: Optional[float] = None,
+    min_calib_samples_per_location: Optional[int] = None,
+    min_calib_unknown_samples: Optional[int] = None,
+    min_test_samples_per_location: Optional[int] = None,
+    min_test_unknown_samples: Optional[int] = None,
     device: str = "cpu",
     base_config: Optional[CampusHuntConfig] = None,
 ) -> bool:
-    """Run threshold calibration on calibration data, then evaluate on test data."""
+    """Run threshold calibration on calibration data, then evaluate on test data.
+
+    Fails closed:
+    - If calibration data is inadequate, fails without creating a config.
+    - If no threshold candidate meets all safety constraints, fails without writing/overwriting config.
+    - If test data is unavailable or incomplete, marks status accordingly and does not present partial metrics.
+    """
     if not embeddings_npz.exists() or not metadata_json.exists():
         logger.error(
             "Reference embeddings not found ('%s', '%s').\n"
@@ -315,6 +346,31 @@ def run_calibration(
         return False
 
     cfg = base_config or CampusHuntConfig.from_env()
+    effective_max_far = max_far if max_far is not None else cfg.scoring.target_max_far
+    effective_min_unknown_rejection = (
+        min_unknown_rejection if min_unknown_rejection is not None else cfg.scoring.target_min_unknown_rejection
+    )
+    effective_min_calib_samples = (
+        min_calib_samples_per_location
+        if min_calib_samples_per_location is not None
+        else cfg.scoring.min_calibration_samples_per_location
+    )
+    effective_min_calib_unknown = (
+        min_calib_unknown_samples
+        if min_calib_unknown_samples is not None
+        else cfg.scoring.min_calibration_unknown_samples
+    )
+    effective_min_test_samples = (
+        min_test_samples_per_location
+        if min_test_samples_per_location is not None
+        else cfg.scoring.min_test_samples_per_location
+    )
+    effective_min_test_unknown = (
+        min_test_unknown_samples
+        if min_test_unknown_samples is not None
+        else cfg.scoring.min_test_unknown_samples
+    )
+
     model_name = cfg.model.model_name
     pretrained = cfg.model.pretrained
 
@@ -357,10 +413,11 @@ def run_calibration(
         return False
 
     # Check adequacy of calibration captures
-    is_adequate, missing_locs = check_calibration_data_adequacy(
+    is_adequate, missing_locs = check_split_data_adequacy(
         store=store,
         sample_counts=calib_dataset.sample_counts,
-        min_samples_per_location=1,
+        min_samples_per_location=effective_min_calib_samples,
+        min_unknown_samples=effective_min_calib_unknown,
     )
 
     if not is_adequate:
@@ -377,9 +434,10 @@ def run_calibration(
 
     print("\n" + "=" * 80)
     print("CALIBRATION SET THRESHOLD & MARGIN SEARCH (data/calibration/)")
+    print(f"Constraints: FAR <= {effective_max_far * 100:.2f}%, Unknown Rejection >= {effective_min_unknown_rejection * 100:.1f}%")
     print("=" * 80)
     print(
-        f"{'Match Thresh':<14} {'Margin':<10} {'Accept Rate':<14} {'False Accept (FAR)':<20} {'Unknown Reject':<16}"
+        f"{'Match Thresh':<14} {'Margin':<10} {'Accept Rate':<14} {'False Accept (FAR)':<20} {'Unknown Reject':<16} {'Meets Constraints'}"
     )
     print("-" * 80)
 
@@ -399,39 +457,98 @@ def run_calibration(
                 mismatch_threshold=None,
             )
             all_results.append(res)
+
+            meets_constraints = (
+                res["wrong_false_accept_rate"] <= effective_max_far
+                and res["unknown_rejection_rate"] >= effective_min_unknown_rejection
+            )
+            status_str = "YES" if meets_constraints else "NO"
+
             print(
                 f"{res['match_threshold']:<14.2f} "
                 f"{res['margin_threshold']:<10.2f} "
                 f"{res['correct_accept_rate'] * 100:>10.1f}%   "
                 f"{res['wrong_false_accept_rate'] * 100:>14.2f}%   "
-                f"{res['unknown_rejection_rate'] * 100:>14.1f}%"
+                f"{res['unknown_rejection_rate'] * 100:>14.1f}%   "
+                f"{status_str:>17}"
             )
 
-            if res["wrong_false_accept_rate"] <= max_far and res["unknown_rejection_rate"] >= 0.90:
+            if meets_constraints:
                 if res["correct_accept_rate"] > best_accept_rate:
                     best_accept_rate = res["correct_accept_rate"]
                     best_config = res
 
     print("=" * 80 + "\n")
 
+    # FIX B: FAIL CLOSED if no candidate meets all constraints
     if best_config is None:
-        logger.warning(
-            "No candidate thresholds satisfied the strict constraint (FAR <= %.2f%%). "
-            "Selecting safest threshold with lowest FAR.",
-            max_far * 100,
+        logger.error(
+            "Calibration FAILED: No candidate threshold pair satisfied all safety constraints:\n"
+            "  - Maximum False Acceptance Rate (FAR) <= %.2f%%\n"
+            "  - Minimum Unknown Rejection Rate >= %.1f%%\n"
+            "Tested %d candidate threshold combinations.\n"
+            "No active calibrated configuration will be created or overwritten.",
+            effective_max_far * 100,
+            effective_min_unknown_rejection * 100,
+            len(all_results),
         )
-        best_config = min(all_results, key=lambda x: (x["wrong_false_accept_rate"], -x["correct_accept_rate"]))
+
+        print("!" * 80)
+        print("CALIBRATION FAILURE: NO CANDIDATE MET REQUIRED SAFETY CONSTRAINTS")
+        print("!" * 80)
+        print(f"Required: FAR <= {effective_max_far * 100:.2f}%, Unknown Rejection >= {effective_min_unknown_rejection * 100:.1f}%")
+        print("Closest candidates evaluated (for diagnosis):")
+        sorted_candidates = sorted(all_results, key=lambda x: (x["wrong_false_accept_rate"], -x["unknown_rejection_rate"]))
+        for c in sorted_candidates[:5]:
+            print(
+                f"  Match={c['match_threshold']:.2f}, Margin={c['margin_threshold']:.2f} -> "
+                f"FAR={c['wrong_false_accept_rate']*100:.2f}%, Rejection={c['unknown_rejection_rate']*100:.1f}%, Accept={c['correct_accept_rate']*100:.1f}%"
+            )
+        print("!" * 80 + "\n")
+
+        # Save diagnostic report if requested (explicitly non-deployable, calibrated=False)
+        if diagnostic_report:
+            diag_path = Path(diagnostic_report)
+            diag_path.parent.mkdir(parents=True, exist_ok=True)
+            diag_data = {
+                "status": "calibration_failed_constraints_unmet",
+                "deployable": False,
+                "calibrated": False,
+                "model_version": store.model_version,
+                "failed_at": datetime.now(timezone.utc).isoformat(),
+                "constraints": {
+                    "max_far": effective_max_far,
+                    "min_unknown_rejection": effective_min_unknown_rejection,
+                },
+                "total_candidates_tested": len(all_results),
+                "calibration_sample_counts": dict(calib_dataset.sample_counts),
+                "closest_candidates": [
+                    {
+                        "match_threshold": r["match_threshold"],
+                        "margin_threshold": r["margin_threshold"],
+                        "correct_accept_rate": round(r["correct_accept_rate"], 4),
+                        "wrong_false_accept_rate": round(r["wrong_false_accept_rate"], 6),
+                        "unknown_rejection_rate": round(r["unknown_rejection_rate"], 4),
+                    }
+                    for r in sorted_candidates[:10]
+                ],
+            }
+            with open(diag_path, "w", encoding="utf-8") as f:
+                json.dump(diag_data, f, indent=2)
+            logger.info("Saved non-deployable diagnostic report to '%s'.", diag_path)
+
+        return False
 
     print("SELECTED THRESHOLDS (from calibration data):")
-    print(f"  Selected Match Threshold:  {best_config['match_threshold']:.3f}")
-    print(f"  Selected Margin Threshold: {best_config['margin_threshold']:.3f}")
+    print(f"  Selected Match Threshold:      {best_config['match_threshold']:.3f}")
+    print(f"  Selected Margin Threshold:     {best_config['margin_threshold']:.3f}")
     print(f"  Calibration Acceptance Rate:   {best_config['correct_accept_rate'] * 100:.1f}%")
     print(f"  Calibration Wrong Location FAR:{best_config['wrong_false_accept_rate'] * 100:.2f}%")
     print(f"  Calibration Unknown Rejection: {best_config['unknown_rejection_rate'] * 100:.1f}%\n")
 
     print_confusion_matrix(best_config["confusion_counts"], store.locations, title="CALIBRATION CONFUSION MATRIX")
 
-    # 2. Separate Test Evaluation
+    # 2. FIX A: Rigorous Hold-Out Test Split Evaluation
     test_dataset = SplitDataset(
         dataset_dir=test_dir,
         store=store,
@@ -439,61 +556,99 @@ def run_calibration(
         scorer=scorer,
         split_name="test",
     )
-    has_test_data = test_dataset.load_and_score()
+    has_test_files = test_dataset.load_and_score()
 
     test_eval_metadata: TestEvaluationMetrics
 
-    if not has_test_data:
+    if not has_test_files:
         print("!" * 80)
         print("NOTICE: Final evaluation on independent test data is UNAVAILABLE.")
         print(f"No test photos found in '{test_dir}'.")
         print("Calibration metrics shown above must NOT be reported as independent test performance.")
-        print("Collect separate test photos to measure unbiased generalization accuracy.")
+        print("Collect separate hold-out test photos across all locations before deploying.")
         print("!" * 80 + "\n")
+
+        all_missing = [f"{loc} (count=0 < {effective_min_test_samples})" for loc in store.locations]
+        all_missing.append(f"unknown (count=0 < {effective_min_test_unknown})")
 
         test_eval_metadata = TestEvaluationMetrics(
             status="unavailable",
             reason=f"No independent test captures found in '{test_dir}'.",
+            sample_counts=dict(test_dataset.sample_counts),
+            missing_categories=all_missing,
+            metrics=None,
         )
     else:
-        test_res = evaluate_thresholds(
-            samples=test_dataset.samples,
+        # Check completeness of test split
+        is_test_complete, missing_test = check_split_data_adequacy(
             store=store,
-            scorer=scorer,
-            base_scoring_config=cfg.scoring,
-            match_threshold=best_config["match_threshold"],
-            margin_threshold=best_config["margin_threshold"],
-            mismatch_threshold=None,
+            sample_counts=test_dataset.sample_counts,
+            min_samples_per_location=effective_min_test_samples,
+            min_unknown_samples=effective_min_test_unknown,
         )
 
-        print("\n" + "=" * 80)
-        print("INDEPENDENT TEST SET EVALUATION (Unbiased generalization)")
-        print("=" * 80)
-        print(f"  Test Correct Acceptance Rate:  {test_res['correct_accept_rate'] * 100:.1f}%")
-        print(f"  Test Wrong Location FAR:       {test_res['wrong_false_accept_rate'] * 100:.2f}%")
-        print(f"  Test Unknown Rejection Rate:   {test_res['unknown_rejection_rate'] * 100:.1f}%")
-        print("=" * 80 + "\n")
+        if not is_test_complete:
+            print("!" * 80)
+            print("WARNING: Final evaluation on independent test data is INCOMPLETE.")
+            print(f"Test directory '{test_dir}' contains captures, but required categories or counts are missing:")
+            for m in missing_test:
+                print(f"  - {m}")
+            print("Partial test metrics will NOT be reported as completed independent test performance.")
+            print("Collect complete hold-out test captures across all locations to evaluate generalization.")
+            print("!" * 80 + "\n")
 
-        print_confusion_matrix(test_res["confusion_counts"], store.locations, title="INDEPENDENT TEST CONFUSION MATRIX")
+            test_eval_metadata = TestEvaluationMetrics(
+                status="incomplete",
+                reason=f"Test split is incomplete. Missing required categories or counts: {', '.join(missing_test)}",
+                sample_counts=dict(test_dataset.sample_counts),
+                missing_categories=missing_test,
+                metrics=None,  # Do not present partial metrics as completed!
+            )
+        else:
+            # Complete test split: evaluate selected thresholds ONCE
+            test_res = evaluate_thresholds(
+                samples=test_dataset.samples,
+                store=store,
+                scorer=scorer,
+                base_scoring_config=cfg.scoring,
+                match_threshold=best_config["match_threshold"],
+                margin_threshold=best_config["margin_threshold"],
+                mismatch_threshold=None,
+            )
 
-        test_eval_metadata = TestEvaluationMetrics(
-            status="completed",
-            sample_counts=dict(test_dataset.sample_counts),
-            metrics=CalibrationMetrics(
-                correct_accept_rate=round(test_res["correct_accept_rate"], 4),
-                wrong_false_accept_rate=round(test_res["wrong_false_accept_rate"], 6),
-                unknown_rejection_rate=round(test_res["unknown_rejection_rate"], 4),
-                correct_trials=test_res["correct_trials"],
-                correct_accepts=test_res["correct_accepts"],
-                wrong_trials=test_res["wrong_trials"],
-                wrong_false_accepts=test_res["wrong_false_accepts"],
-                unknown_trials=test_res["unknown_trials"],
-                unknown_rejections=test_res["unknown_rejections"],
-            ),
-        )
+            print("\n" + "=" * 80)
+            print("INDEPENDENT TEST SET EVALUATION (Unbiased hold-out generalization)")
+            print("=" * 80)
+            print(f"  Test Correct Acceptance Rate:  {test_res['correct_accept_rate'] * 100:.1f}%")
+            print(f"  Test Wrong Location FAR:       {test_res['wrong_false_accept_rate'] * 100:.2f}%")
+            print(f"  Test Unknown Rejection Rate:   {test_res['unknown_rejection_rate'] * 100:.1f}%")
+            print("=" * 80 + "\n")
 
-    # 3. Write compatible CampusHuntConfig JSON
+            print_confusion_matrix(test_res["confusion_counts"], store.locations, title="INDEPENDENT TEST CONFUSION MATRIX")
+
+            test_eval_metadata = TestEvaluationMetrics(
+                status="completed",
+                reason=None,
+                sample_counts=dict(test_dataset.sample_counts),
+                missing_categories=None,
+                metrics=CalibrationMetrics(
+                    correct_accept_rate=round(test_res["correct_accept_rate"], 4),
+                    wrong_false_accept_rate=round(test_res["wrong_false_accept_rate"], 6),
+                    unknown_rejection_rate=round(test_res["unknown_rejection_rate"], 4),
+                    correct_trials=test_res["correct_trials"],
+                    correct_accepts=test_res["correct_accepts"],
+                    wrong_trials=test_res["wrong_trials"],
+                    wrong_false_accepts=test_res["wrong_false_accepts"],
+                    unknown_trials=test_res["unknown_trials"],
+                    unknown_rejections=test_res["unknown_rejections"],
+                ),
+            )
+
+    # 3. Write compatible CampusHuntConfig JSON atomically
     if output_config:
+        output_config = Path(output_config)
+        output_config.parent.mkdir(parents=True, exist_ok=True)
+
         calib_cfg = CampusHuntConfig(
             model=ModelConfig(
                 model_name=store.metadata.get("model_name", model_name),
@@ -507,8 +662,14 @@ def run_calibration(
                 calibrated=True,
                 match_threshold=round(best_config["match_threshold"], 4),
                 margin_threshold=round(best_config["margin_threshold"], 4),
-                mismatch_threshold=None,  # Do not insert unvalidated mismatch threshold
+                mismatch_threshold=None,
                 min_reference_images_per_location=cfg.scoring.min_reference_images_per_location,
+                min_calibration_samples_per_location=effective_min_calib_samples,
+                min_calibration_unknown_samples=effective_min_calib_unknown,
+                min_test_samples_per_location=effective_min_test_samples,
+                min_test_unknown_samples=effective_min_test_unknown,
+                target_max_far=effective_max_far,
+                target_min_unknown_rejection=effective_min_unknown_rejection,
             ),
             storage=StorageConfig(
                 reference_data_dir=cfg.storage.reference_data_dir,
@@ -535,8 +696,13 @@ def run_calibration(
                 test_evaluation=test_eval_metadata,
             ),
         )
-        calib_cfg.to_json_file(output_config)
-        logger.info("Saved compatible calibrated configuration to '%s'.", output_config)
+
+        # Atomic write: write to temp file first, then replace
+        tmp_output = output_config.with_suffix(f".tmp_{os.getpid()}_{datetime.now().strftime('%f')}")
+        calib_cfg.to_json_file(tmp_output)
+        tmp_output.replace(output_config)
+
+        logger.info("Saved compatible calibrated configuration atomically to '%s'.", output_config)
 
     return True
 
@@ -585,10 +751,46 @@ def main() -> None:
         help="Path to save recommended calibrated configuration",
     )
     parser.add_argument(
+        "--diagnostic-report",
+        type=Path,
+        default=None,
+        help="Optional path to save failure diagnostic report if constraints cannot be met",
+    )
+    parser.add_argument(
         "--max-far",
         type=float,
-        default=0.02,
-        help="Maximum tolerable False Acceptance Rate (default: 0.02 = 2%%)",
+        default=None,
+        help="Maximum tolerable False Acceptance Rate (default: from config, e.g. 0.02 = 2%%)",
+    )
+    parser.add_argument(
+        "--min-unknown-rejection",
+        type=float,
+        default=None,
+        help="Minimum tolerable Unknown Rejection Rate (default: from config, e.g. 0.90 = 90%%)",
+    )
+    parser.add_argument(
+        "--min-calib-samples",
+        type=int,
+        default=None,
+        help="Minimum calibration captures per location (default: 1)",
+    )
+    parser.add_argument(
+        "--min-calib-unknown",
+        type=int,
+        default=None,
+        help="Minimum unknown/distractor calibration captures (default: 1)",
+    )
+    parser.add_argument(
+        "--min-test-samples",
+        type=int,
+        default=None,
+        help="Minimum test captures per location required for complete evaluation (default: 1)",
+    )
+    parser.add_argument(
+        "--min-test-unknown",
+        type=int,
+        default=None,
+        help="Minimum unknown test captures required for complete evaluation (default: 1)",
     )
     parser.add_argument(
         "--device",
@@ -601,7 +803,6 @@ def main() -> None:
 
     # Resolve calibration directory
     calib_dir = args.calibration_dir or args.validation_dir or cfg.storage.calibration_data_dir
-    # If data/calibration doesn't exist but data/validation does, fallback gracefully
     if not calib_dir.exists() and cfg.storage.validation_data_dir.exists():
         calib_dir = cfg.storage.validation_data_dir
 
@@ -611,7 +812,13 @@ def main() -> None:
         embeddings_npz=args.embeddings_npz,
         metadata_json=args.metadata_json,
         output_config=args.output_config,
+        diagnostic_report=args.diagnostic_report,
         max_far=args.max_far,
+        min_unknown_rejection=args.min_unknown_rejection,
+        min_calib_samples_per_location=args.min_calib_samples,
+        min_calib_unknown_samples=args.min_calib_unknown,
+        min_test_samples_per_location=args.min_test_samples,
+        min_test_unknown_samples=args.min_test_unknown,
         device=args.device,
         base_config=cfg,
     )

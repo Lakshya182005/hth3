@@ -113,6 +113,38 @@ class ScoringConfig(BaseModel):
         description="Minimum number of reference photos required for a location to be valid.",
         ge=1,
     )
+    min_calibration_samples_per_location: int = Field(
+        default=1,
+        description="Minimum calibration captures per location required to run calibration (data-quality safeguard).",
+        ge=1,
+    )
+    min_calibration_unknown_samples: int = Field(
+        default=1,
+        description="Minimum unknown/distractor captures required for calibration.",
+        ge=1,
+    )
+    min_test_samples_per_location: int = Field(
+        default=1,
+        description="Minimum hold-out test captures per location required for complete evaluation.",
+        ge=1,
+    )
+    min_test_unknown_samples: int = Field(
+        default=1,
+        description="Minimum unknown/distractor hold-out test captures required for complete evaluation.",
+        ge=1,
+    )
+    target_max_far: float = Field(
+        default=0.02,
+        description="Maximum acceptable false acceptance rate constraint for calibration.",
+        ge=0.0,
+        le=1.0,
+    )
+    target_min_unknown_rejection: float = Field(
+        default=0.90,
+        description="Minimum acceptable unknown rejection rate constraint for calibration.",
+        ge=0.0,
+        le=1.0,
+    )
 
 
 class StorageConfig(BaseModel):
@@ -168,9 +200,10 @@ class TestEvaluationMetrics(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    status: Literal["completed", "unavailable"]
+    status: Literal["completed", "incomplete", "unavailable"]
     reason: Optional[str] = None
     sample_counts: Optional[Dict[str, int]] = None
+    missing_categories: Optional[List[str]] = None
     metrics: Optional[CalibrationMetrics] = None
 
 
@@ -218,6 +251,10 @@ class CampusHuntConfig(BaseModel):
             cfg.scoring.margin_threshold = float(os.environ["CAMPUS_HUNT_MARGIN_THRESHOLD"])
         if "CAMPUS_HUNT_MISMATCH_THRESHOLD" in os.environ:
             cfg.scoring.mismatch_threshold = float(os.environ["CAMPUS_HUNT_MISMATCH_THRESHOLD"])
+        if "CAMPUS_HUNT_TARGET_MAX_FAR" in os.environ:
+            cfg.scoring.target_max_far = float(os.environ["CAMPUS_HUNT_TARGET_MAX_FAR"])
+        if "CAMPUS_HUNT_TARGET_MIN_UNKNOWN_REJECTION" in os.environ:
+            cfg.scoring.target_min_unknown_rejection = float(os.environ["CAMPUS_HUNT_TARGET_MIN_UNKNOWN_REJECTION"])
         if "CAMPUS_HUNT_EMBEDDINGS_PATH" in os.environ:
             cfg.storage.embeddings_path = Path(os.environ["CAMPUS_HUNT_EMBEDDINGS_PATH"])
         if "CAMPUS_HUNT_METADATA_PATH" in os.environ:
