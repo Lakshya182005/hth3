@@ -6,13 +6,32 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from campus_hunt_cv.exceptions import ConfigurationError
 
 
 DEFAULT_MIN_CALIBRATION_SAMPLES_PER_LOCATION = 5
 DEFAULT_MIN_CALIBRATION_UNKNOWN_SAMPLES = 10
 DEFAULT_MIN_TEST_SAMPLES_PER_LOCATION = 5
 DEFAULT_MIN_TEST_UNKNOWN_SAMPLES = 10
+
+
+def normalize_environment(val: Optional[str]) -> str:
+    """Normalize runtime environment string with safe fallback to 'production'.
+
+    Supported values: 'development', 'test', 'production' (case-insensitive).
+    Defaults to 'production' if unset or invalid.
+    """
+    if not val or not isinstance(val, str):
+        return "production"
+    cleaned = val.strip().lower()
+    if cleaned in ("development", "dev"):
+        return "development"
+    if cleaned in ("test", "testing"):
+        return "test"
+    if cleaned in ("production", "prod"):
+        return "production"
+    return "production"
 
 
 class ImageLimitsConfig(BaseModel):
@@ -244,16 +263,92 @@ class CampusHuntConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    environment: str = Field(
+        default="production",
+        description=(
+            "Runtime deployment environment: 'development', 'test', or 'production'. "
+            "Defaults strictly to 'production' if unset or invalid."
+        ),
+    )
     model: ModelConfig = Field(default_factory=ModelConfig)
     image_limits: ImageLimitsConfig = Field(default_factory=ImageLimitsConfig)
     scoring: ScoringConfig = Field(default_factory=ScoringConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     calibration_metadata: Optional[CalibrationMetadata] = None
 
+    @field_validator("environment", mode="before")
+    @classmethod
+    def _validate_environment(cls, v: Any) -> str:
+        return normalize_environment(v)
+
+    @property
+    def effective_environment(self) -> str:
+        """Determine the effective runtime environment with strict production default.
+
+        Precedence:
+        1. Host process environment variable `CAMPUS_HUNT_ENVIRONMENT` if explicitly set.
+        2. Configured `environment` field on this instance if set and non-empty.
+        3. Safe default: 'production'.
+
+        All values are normalized via `normalize_environment()`.
+        Unset, empty, or unrecognized values strictly resolve to 'production'.
+        """
+        env_from_os = os.environ.get("CAMPUS_HUNT_ENVIRONMENT")
+        if env_from_os is not None and env_from_os.strip() != "":
+            return normalize_environment(env_from_os)
+        return normalize_environment(getattr(self, "environment", "production"))
+
+    @property
+    def is_production(self) -> bool:
+        """Check whether the effective runtime environment is production."""
+        return self.effective_environment == "production"
+
+    def validate_for_production(self) -> None:
+        """Validate that the configuration is safe for production deployment.
+
+        Enforces that unsafe development overrides are not active in production.
+
+        Raises:
+            ConfigurationError: If allow_unvalidated_auto_accept is enabled in production,
+                or if calibration/hold-out test metadata is incomplete or provisional.
+        """
+        if self.is_production and self.scoring.allow_unvalidated_auto_accept:
+            raise ConfigurationError(
+                "Unsafe configuration rejected: 'allow_unvalidated_auto_accept' cannot be enabled "
+                f"in production environment (effective environment: '{self.effective_environment}'). "
+                "Set CAMPUS_HUNT_ENVIRONMENT=development for local development testing.",
+                reason_code="ERROR_UNSAFE_PRODUCTION_CONFIG",
+            )
+        if self.is_production:
+            if self.calibration_metadata is None:
+                raise ConfigurationError(
+                    "Production configuration rejected: calibration metadata is missing. "
+                    "Run campus-hunt-calibrate to produce a validated configuration.",
+                    reason_code="ERROR_UNVALIDATED_PRODUCTION_CONFIG",
+                )
+            if self.calibration_metadata.status == "provisional" or self.calibration_metadata.is_provisional:
+                raise ConfigurationError(
+                    "Production configuration rejected: calibration status is provisional. "
+                    "Adequate calibration samples must be collected before deploying to production.",
+                    reason_code="ERROR_PROVISIONAL_PRODUCTION_CONFIG",
+                )
+            test_eval = self.calibration_metadata.test_evaluation
+            if test_eval is None or test_eval.status != "completed" or test_eval.is_provisional:
+                raise ConfigurationError(
+                    "Production configuration rejected: hold-out test evaluation is incomplete or unavailable. "
+                    "Complete independent test evaluation must pass before deploying to production.",
+                    reason_code="ERROR_INCOMPLETE_TEST_PRODUCTION_CONFIG",
+                )
+
     @classmethod
     def from_env(cls) -> CampusHuntConfig:
         """Create configuration with environment variable overrides."""
         cfg = cls()
+
+        if "CAMPUS_HUNT_ENVIRONMENT" in os.environ:
+            cfg.environment = normalize_environment(os.environ["CAMPUS_HUNT_ENVIRONMENT"])
+        else:
+            cfg.environment = "production"
 
         if "CAMPUS_HUNT_MODEL_NAME" in os.environ:
             cfg.model.model_name = os.environ["CAMPUS_HUNT_MODEL_NAME"]
@@ -300,10 +395,17 @@ class CampusHuntConfig(BaseModel):
 
         Enforces strict schema validation (`extra='forbid'`) so misplaced or
         unknown calibration fields are immediately flagged rather than silently ignored.
+        Runtime environment defaults strictly to 'production' unless overridden by host environment.
         """
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return cls.model_validate(data)
+        cfg = cls.model_validate(data)
+        if "CAMPUS_HUNT_ENVIRONMENT" in os.environ:
+            cfg.environment = normalize_environment(os.environ["CAMPUS_HUNT_ENVIRONMENT"])
+        elif cfg.environment != "production":
+            # Config file cannot override host environment to development when unset
+            cfg.environment = "production"
+        return cfg
 
     def to_json_file(self, path: Union[str, Path]) -> None:
         """Persist configuration to a formatted JSON file."""

@@ -228,6 +228,7 @@ The configuration file written by `campus-hunt-calibrate` uses a nested structur
 
 ```json
 {
+  "environment": "production",
   "model": {
     "model_name": "ViT-B-32",
     "pretrained": "laion2b_s34b_b79k",
@@ -330,14 +331,40 @@ To guarantee competition integrity, matching thresholds alone is **not** suffici
 > [!NOTE]
 > When a submission is routed to manual review due to provisional or uncompleted hold-out status, **all computed score fields are fully preserved** in the response dictionary (`target_score`, `margin`, `best_matching_location_id`, `best_competing_score`). This gives human adjudicators complete quantitative context to evaluate the photo immediately.
 
-#### Explicit Opt-In Override (`allow_unvalidated_auto_accept`)
-If automatic acceptance is explicitly required during local development or controlled dry-runs before independent hold-out test captures are collected, set:
-- In JSON config: `"scoring": { "allow_unvalidated_auto_accept": true }`
-- OR via environment variable: `CAMPUS_HUNT_ALLOW_UNVALIDATED_AUTO_ACCEPT=1`
-- OR CLI flag during calibration: `--allow-unvalidated-auto-accept`
+#### Runtime Environment & Explicit Opt-In Override (`allow_unvalidated_auto_accept`)
+
+The verification engine features an explicit runtime environment setting (`CAMPUS_HUNT_ENVIRONMENT`) with supported values:
+- `production` (default)
+- `development` (or `dev`)
+- `test` (or `testing`)
+
+If `CAMPUS_HUNT_ENVIRONMENT` is unset, empty, or set to an unrecognized string, the system **strictly defaults to `production`**.
+
+##### Production Protection (Fail-Closed)
+In `production`, the `allow_unvalidated_auto_accept` override is **strictly blocked**. Even if enabled in a JSON config file (`"allow_unvalidated_auto_accept": true`) or via environment variable (`CAMPUS_HUNT_ALLOW_UNVALIDATED_AUTO_ACCEPT=1`), the runtime safety gate will refuse to bypass validation. Any provisional or uncompleted hold-out configuration will safely fail closed to `ambiguous` with `PROVISIONAL_CALIBRATION_REQUIRES_REVIEW` or `HOLDOUT_TEST_NOT_COMPLETED`.
+
+Calling `config.validate_for_production()` at service startup will raise a `ConfigurationError` if unsafe overrides or incomplete calibration/hold-out splits are present.
+
+##### Local Development / Testing Use
+If automatic acceptance is explicitly needed during local development, integration testing, or dry-runs before independent hold-out captures are gathered:
+1. Set the runtime environment to `development` or `test`:
+   ```bash
+   export CAMPUS_HUNT_ENVIRONMENT=development
+   ```
+2. Enable the override via environment variable, config JSON, or calibration CLI:
+   ```bash
+   # Option A: Environment variable
+   export CAMPUS_HUNT_ALLOW_UNVALIDATED_AUTO_ACCEPT=1
+
+   # Option B: CLI flag during calibration
+   campus-hunt-calibrate --allow-unvalidated-auto-accept
+
+   # Option C: JSON config
+   # "scoring": { "allow_unvalidated_auto_accept": true }
+   ```
 
 > [!CAUTION]
-> `allow_unvalidated_auto_accept` defaults strictly to `false`. It bypasses the hold-out test safety gate and should **never** be enabled in production or on competition day.
+> `allow_unvalidated_auto_accept` works **only** when `CAMPUS_HUNT_ENVIRONMENT` is explicitly set to `development` or `test`. In production (the default), this override is completely ignored and blocked to protect competition integrity.
 
 ---
 

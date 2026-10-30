@@ -752,6 +752,7 @@ def run_calibration(
         )
 
         calib_cfg = CampusHuntConfig(
+            environment="production",
             model=ModelConfig(
                 model_name=store.metadata.get("model_name", model_name),
                 pretrained=store.metadata.get("pretrained", pretrained),
@@ -916,6 +917,12 @@ def main() -> None:
 
     if args.allow_unvalidated_auto_accept:
         cfg.scoring.allow_unvalidated_auto_accept = True
+        logger.warning(
+            "CRITICAL WARNING: --allow-unvalidated-auto-accept is active. "
+            "The generated configuration will allow unvalidated auto-acceptance ONLY when "
+            "CAMPUS_HUNT_ENVIRONMENT is explicitly set to 'development' or 'test'. "
+            "This override is strictly blocked in production (the default runtime environment)."
+        )
 
     # Resolve calibration directory
     calib_dir = args.calibration_dir or args.validation_dir or cfg.storage.calibration_data_dir

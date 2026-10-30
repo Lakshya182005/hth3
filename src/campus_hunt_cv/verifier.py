@@ -64,8 +64,9 @@ def check_config_validation_status(config: CampusHuntConfig) -> Tuple[bool, Opti
     """Verify whether a configuration is authorized for automatic 'strong_match' progression.
 
     Rules:
-    1. Explicit Opt-In: If config.scoring.allow_unvalidated_auto_accept is True,
-       automatic acceptance is permitted (intended strictly for development/controlled testing).
+    1. Environment-Gated Override: config.scoring.allow_unvalidated_auto_accept is honored
+       ONLY in 'development' or 'test' environments. In 'production' (the default), this override
+       is strictly blocked and a security warning is logged.
     2. Missing Metadata: If config.calibration_metadata is None, calibration provenance
        and hold-out test completion cannot be verified. Fails safe to 'HOLDOUT_TEST_NOT_COMPLETED'.
     3. Provisional Calibration: If config.calibration_metadata.status == 'provisional'
@@ -77,8 +78,20 @@ def check_config_validation_status(config: CampusHuntConfig) -> Tuple[bool, Opti
     5. Fully Validated: Both calibration and hold-out test splits met all quality standards
        without provisional overrides. Returns (True, None).
     """
+    effective_env = getattr(config, "effective_environment", "production")
+
     if config.scoring.allow_unvalidated_auto_accept:
-        return True, None
+        if effective_env in ("development", "test"):
+            logger.info(
+                "Allowing unvalidated auto-accept override (effective environment: '%s').",
+                effective_env,
+            )
+            return True, None
+        logger.warning(
+            "Blocked allow_unvalidated_auto_accept override: runtime environment is '%s'. "
+            "Unvalidated auto-acceptance is strictly prohibited in production.",
+            effective_env,
+        )
 
     meta = config.calibration_metadata
     if meta is None:
@@ -119,6 +132,14 @@ class LocationVerifier:
             store: Reference embeddings store. If None, loaded from configured paths if available.
         """
         self.config = config or CampusHuntConfig.from_env()
+
+        if self.config.is_production and self.config.scoring.allow_unvalidated_auto_accept:
+            logger.warning(
+                "CRITICAL WARNING: 'allow_unvalidated_auto_accept' is enabled in a production environment "
+                "(effective environment: '%s'). This override is strictly blocked in production; "
+                "verification will fail closed to 'ambiguous'.",
+                self.config.effective_environment,
+            )
 
         # Model embedder
         if embedder is not None:

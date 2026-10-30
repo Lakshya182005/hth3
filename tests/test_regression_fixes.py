@@ -26,13 +26,14 @@ from campus_hunt_cv.config import (
     ModelConfig,
     ScoringConfig,
     TestEvaluationMetrics,
+    normalize_environment,
 )
 
 # Tell pytest not to treat TestEvaluationMetrics as a pytest test suite class
 TestEvaluationMetrics.__test__ = False
 from campus_hunt_cv.decision import DecisionEngine
 from campus_hunt_cv.embeddings_store import ReferenceEmbeddingsStore
-from campus_hunt_cv.exceptions import ReferenceDataError
+from campus_hunt_cv.exceptions import ConfigurationError, ReferenceDataError
 from campus_hunt_cv.similarity import SimilarityScorer
 from campus_hunt_cv.verifier import LocationVerifier
 from tests.conftest import MockEmbedder, create_test_image_bytes
@@ -1175,21 +1176,24 @@ def test_fully_calibrated_completed_holdout_produces_strong_match(mock_reference
     assert result["margin"] >= 0.08
 
 
-def test_explicit_opt_in_allows_unvalidated_auto_accept(mock_reference_store: ReferenceEmbeddingsStore):
-    """Setting allow_unvalidated_auto_accept=True permits strong_match even when unvalidated or provisional."""
+def test_unvalidated_auto_accept_blocked_when_env_unset(
+    monkeypatch,
+    mock_reference_store: ReferenceEmbeddingsStore,
+):
+    """Safeguard: unvalidated auto-accept is strictly blocked when CAMPUS_HUNT_ENVIRONMENT is unset."""
+    monkeypatch.delenv("CAMPUS_HUNT_ENVIRONMENT", raising=False)
     clock_ref = mock_reference_store.get_location_embeddings("clock_tower")[0]
 
     class ControlledEmbedder(MockEmbedder):
         def embed_image(self, image):
             return clock_ref.copy()
 
-    # Provisional calibration + unavailable test split, BUT explicit opt-in is enabled
     cfg = CampusHuntConfig()
     cfg.scoring = ScoringConfig(
         calibrated=True,
         match_threshold=0.60,
         margin_threshold=0.08,
-        allow_unvalidated_auto_accept=True,  # Explicit opt-in
+        allow_unvalidated_auto_accept=True,  # Opt-in attempted
     )
     cfg.calibration_metadata = CalibrationMetadata(
         status="provisional",
@@ -1204,6 +1208,10 @@ def test_explicit_opt_in_allows_unvalidated_auto_accept(mock_reference_store: Re
         test_evaluation=TestEvaluationMetrics(status="unavailable", metrics=None),
     )
 
+    # When environment is unset, runtime defaults strictly to production
+    assert cfg.effective_environment == "production"
+    assert cfg.is_production is True
+
     verifier = LocationVerifier(
         config=cfg,
         embedder=ControlledEmbedder(dimension=64),
@@ -1213,8 +1221,276 @@ def test_explicit_opt_in_allows_unvalidated_auto_accept(mock_reference_store: Re
     image_bytes = create_test_image_bytes()
     result = verifier.verify(image_bytes=image_bytes, target_location_id="clock_tower")
 
-    # With opt-in enabled, strong_match is permitted
+    # Override MUST be blocked: fails closed to ambiguous
+    assert result["result"] == "ambiguous"
+    assert result["reason_code"] == "PROVISIONAL_CALIBRATION_REQUIRES_REVIEW"
+    assert result["target_score"] >= 0.60
+    assert result["margin"] >= 0.08
+
+
+def test_unvalidated_auto_accept_blocked_in_production_with_json_and_env_var(
+    monkeypatch,
+    tmp_path: Path,
+    mock_reference_store: ReferenceEmbeddingsStore,
+):
+    """Safeguard: unvalidated auto-accept is blocked in production even when enabled in JSON and env var."""
+    monkeypatch.setenv("CAMPUS_HUNT_ENVIRONMENT", "production")
+    monkeypatch.setenv("CAMPUS_HUNT_ALLOW_UNVALIDATED_AUTO_ACCEPT", "1")
+
+    json_file = tmp_path / "unsafe_prod_config.json"
+    raw_cfg = {
+        "environment": "production",
+        "model": {
+            "model_name": "ViT-B-32",
+            "pretrained": "mock_test_weights",
+            "device": "cpu",
+            "num_threads": None,
+        },
+        "image_limits": {
+            "max_image_bytes": 15728640,
+            "max_image_pixels": 50000000,
+            "min_image_dimension": 32,
+            "allowed_formats": ["JPEG", "JPG", "PNG", "WEBP"],
+        },
+        "scoring": {
+            "aggregation_method": "top_k_mean",
+            "top_k": 3,
+            "calibrated": True,
+            "match_threshold": 0.60,
+            "margin_threshold": 0.08,
+            "mismatch_threshold": None,
+            "min_reference_images_per_location": 1,
+            "min_calibration_samples_per_location": 5,
+            "min_calibration_unknown_samples": 10,
+            "min_test_samples_per_location": 5,
+            "min_test_unknown_samples": 10,
+            "target_max_far": 0.02,
+            "target_min_unknown_rejection": 0.90,
+            "allow_unvalidated_auto_accept": True,  # Enabled in JSON
+        },
+        "storage": {
+            "reference_data_dir": "data/reference",
+            "calibration_data_dir": "data/calibration",
+            "test_data_dir": "data/test",
+            "embeddings_path": "data/reference_embeddings.npz",
+            "metadata_path": "data/reference_embeddings.meta.json",
+        },
+        "calibration_metadata": {
+            "status": "provisional",
+            "is_provisional": True,
+            "warning": "Lowered safeguards",
+            "model_version": "ViT-B-32/mock_test_weights",
+            "calibrated_at": "2026-10-30T12:00:00Z",
+            "minimums_used": None,
+            "calibration_sample_counts": {"clock_tower": 2, "unknown": 2},
+            "calibration_metrics": {
+                "correct_accept_rate": 0.95,
+                "wrong_false_accept_rate": 0.01,
+                "unknown_rejection_rate": 0.98,
+                "correct_trials": 10,
+                "correct_accepts": 9,
+                "wrong_trials": 10,
+                "wrong_false_accepts": 0,
+                "unknown_trials": 10,
+                "unknown_rejections": 10,
+            },
+            "test_evaluation": {
+                "status": "incomplete",
+                "reason": "Missing categories",
+                "sample_counts": {"clock_tower": 1},
+                "missing_categories": ["unknown"],
+                "minimums_used": None,
+                "is_provisional": False,
+                "metrics": None,
+            },
+        },
+    }
+    json_file.write_text(json.dumps(raw_cfg, indent=2), encoding="utf-8")
+
+    loaded_cfg = CampusHuntConfig.from_json_file(json_file)
+    assert loaded_cfg.effective_environment == "production"
+    assert loaded_cfg.is_production is True
+    assert loaded_cfg.scoring.allow_unvalidated_auto_accept is True
+
+    # validate_for_production() raises ConfigurationError
+    with pytest.raises(ConfigurationError) as exc_info:
+        loaded_cfg.validate_for_production()
+    assert "allow_unvalidated_auto_accept" in str(exc_info.value)
+
+    clock_ref = mock_reference_store.get_location_embeddings("clock_tower")[0]
+
+    class ControlledEmbedder(MockEmbedder):
+        def embed_image(self, image):
+            return clock_ref.copy()
+
+    verifier = LocationVerifier(
+        config=loaded_cfg,
+        embedder=ControlledEmbedder(dimension=64),
+        store=mock_reference_store,
+    )
+
+    image_bytes = create_test_image_bytes()
+    result = verifier.verify(image_bytes=image_bytes, target_location_id="clock_tower")
+
+    # In production, verifier fails closed to ambiguous
+    assert result["result"] == "ambiguous"
+    assert result["reason_code"] == "PROVISIONAL_CALIBRATION_REQUIRES_REVIEW"
+
+
+def test_unvalidated_auto_accept_works_only_in_dev_or_test(
+    monkeypatch,
+    mock_reference_store: ReferenceEmbeddingsStore,
+):
+    """Safeguard: unvalidated auto-accept works ONLY when explicitly in development or test."""
+    clock_ref = mock_reference_store.get_location_embeddings("clock_tower")[0]
+
+    class ControlledEmbedder(MockEmbedder):
+        def embed_image(self, image):
+            return clock_ref.copy()
+
+    def build_test_cfg(allow_opt_in: bool) -> CampusHuntConfig:
+        cfg = CampusHuntConfig()
+        cfg.scoring = ScoringConfig(
+            calibrated=True,
+            match_threshold=0.60,
+            margin_threshold=0.08,
+            allow_unvalidated_auto_accept=allow_opt_in,
+        )
+        cfg.calibration_metadata = CalibrationMetadata(
+            status="provisional",
+            is_provisional=True,
+            warning="Lowered safeguards",
+            model_version="ViT-B-32/mock_test_weights",
+            calibrated_at="2026-10-30T12:00:00Z",
+            calibration_sample_counts={"clock_tower": 1, "unknown": 1},
+            calibration_metrics=CalibrationMetrics(
+                correct_accept_rate=0.95, wrong_false_accept_rate=0.01, unknown_rejection_rate=0.98
+            ),
+            test_evaluation=TestEvaluationMetrics(status="unavailable", metrics=None),
+        )
+        return cfg
+
+    image_bytes = create_test_image_bytes()
+
+    # Case A: Development environment + allow_unvalidated_auto_accept=True -> PERMITTED
+    monkeypatch.setenv("CAMPUS_HUNT_ENVIRONMENT", "development")
+    cfg_dev = build_test_cfg(allow_opt_in=True)
+    verifier_dev = LocationVerifier(config=cfg_dev, embedder=ControlledEmbedder(dimension=64), store=mock_reference_store)
+    res_dev = verifier_dev.verify(image_bytes=image_bytes, target_location_id="clock_tower")
+    assert res_dev["result"] == "strong_match"
+    assert res_dev["reason_code"] == "STRONG_MATCH"
+
+    # Case B: Test environment + allow_unvalidated_auto_accept=True -> PERMITTED
+    monkeypatch.setenv("CAMPUS_HUNT_ENVIRONMENT", "test")
+    cfg_test = build_test_cfg(allow_opt_in=True)
+    verifier_test = LocationVerifier(config=cfg_test, embedder=ControlledEmbedder(dimension=64), store=mock_reference_store)
+    res_test = verifier_test.verify(image_bytes=image_bytes, target_location_id="clock_tower")
+    assert res_test["result"] == "strong_match"
+    assert res_test["reason_code"] == "STRONG_MATCH"
+
+    # Case C: Development environment BUT allow_unvalidated_auto_accept=False -> BLOCKED
+    monkeypatch.setenv("CAMPUS_HUNT_ENVIRONMENT", "development")
+    cfg_dev_no_override = build_test_cfg(allow_opt_in=False)
+    verifier_dev_no_override = LocationVerifier(
+        config=cfg_dev_no_override, embedder=ControlledEmbedder(dimension=64), store=mock_reference_store
+    )
+    res_dev_no_override = verifier_dev_no_override.verify(image_bytes=image_bytes, target_location_id="clock_tower")
+    assert res_dev_no_override["result"] == "ambiguous"
+    assert res_dev_no_override["reason_code"] == "PROVISIONAL_CALIBRATION_REQUIRES_REVIEW"
+
+    # Case D: Invalid environment string (e.g. 'staging') -> Defaults to production -> BLOCKED
+    monkeypatch.setenv("CAMPUS_HUNT_ENVIRONMENT", "staging_cluster")
+    cfg_invalid_env = build_test_cfg(allow_opt_in=True)
+    assert cfg_invalid_env.effective_environment == "production"
+    verifier_invalid = LocationVerifier(
+        config=cfg_invalid_env, embedder=ControlledEmbedder(dimension=64), store=mock_reference_store
+    )
+    res_invalid = verifier_invalid.verify(image_bytes=image_bytes, target_location_id="clock_tower")
+    assert res_invalid["result"] == "ambiguous"
+    assert res_invalid["reason_code"] == "PROVISIONAL_CALIBRATION_REQUIRES_REVIEW"
+
+
+def test_fully_validated_config_works_normally_in_production(
+    monkeypatch,
+    mock_reference_store: ReferenceEmbeddingsStore,
+):
+    """Safeguard: fully validated configurations produce strong_match normally in production."""
+    monkeypatch.setenv("CAMPUS_HUNT_ENVIRONMENT", "production")
+    clock_ref = mock_reference_store.get_location_embeddings("clock_tower")[0]
+
+    class ControlledEmbedder(MockEmbedder):
+        def embed_image(self, image):
+            return clock_ref.copy()
+
+    cfg = CampusHuntConfig()
+    cfg.scoring = ScoringConfig(
+        calibrated=True,
+        match_threshold=0.60,
+        margin_threshold=0.08,
+        allow_unvalidated_auto_accept=False,
+    )
+    cfg.calibration_metadata = CalibrationMetadata(
+        status="calibrated",
+        is_provisional=False,
+        warning=None,
+        model_version="ViT-B-32/mock_test_weights",
+        calibrated_at="2026-10-30T12:00:00Z",
+        minimums_used=None,
+        calibration_sample_counts={"clock_tower": 5, "library": 5, "unknown": 10},
+        calibration_metrics=CalibrationMetrics(
+            correct_accept_rate=0.96, wrong_false_accept_rate=0.005, unknown_rejection_rate=0.99
+        ),
+        test_evaluation=TestEvaluationMetrics(
+            status="completed",
+            reason=None,
+            sample_counts={"clock_tower": 5, "library": 5, "unknown": 10},
+            missing_categories=None,
+            minimums_used=None,
+            is_provisional=False,
+            metrics=CalibrationMetrics(
+                correct_accept_rate=0.95, wrong_false_accept_rate=0.008, unknown_rejection_rate=0.98
+            ),
+        ),
+    )
+
+    # In production, validate_for_production() succeeds
+    cfg.validate_for_production()
+
+    verifier = LocationVerifier(
+        config=cfg,
+        embedder=ControlledEmbedder(dimension=64),
+        store=mock_reference_store,
+    )
+
+    image_bytes = create_test_image_bytes()
+    result = verifier.verify(image_bytes=image_bytes, target_location_id="clock_tower")
+
+    # In production, fully validated config successfully auto-accepts strong matches
     assert result["result"] == "strong_match"
     assert result["reason_code"] == "STRONG_MATCH"
+    assert result["best_matching_location_id"] == "clock_tower"
+    assert result["target_score"] >= 0.60
+    assert result["margin"] >= 0.08
+
+
+def test_normalize_environment_safeguards():
+    """Unit test for environment string normalization and safe fallback."""
+    assert normalize_environment(None) == "production"
+    assert normalize_environment("") == "production"
+    assert normalize_environment("   ") == "production"
+    assert normalize_environment("production") == "production"
+    assert normalize_environment("PRODUCTION") == "production"
+    assert normalize_environment("prod") == "production"
+    assert normalize_environment("PROD") == "production"
+    assert normalize_environment("development") == "development"
+    assert normalize_environment("DEVELOPMENT") == "development"
+    assert normalize_environment("dev") == "development"
+    assert normalize_environment("DEV") == "development"
+    assert normalize_environment("test") == "test"
+    assert normalize_environment("TEST") == "test"
+    assert normalize_environment("testing") == "test"
+    assert normalize_environment("staging") == "production"
+    assert normalize_environment("unknown_env") == "production"
+    assert normalize_environment(123) == "production"
 
 
