@@ -4,14 +4,23 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from datetime import datetime, timezone
 import json
 import logging
 from pathlib import Path
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 
-from campus_hunt_cv.config import CampusHuntConfig, ModelConfig, ScoringConfig
+from campus_hunt_cv.config import (
+    CalibrationMetadata,
+    CalibrationMetrics,
+    CampusHuntConfig,
+    ModelConfig,
+    ScoringConfig,
+    StorageConfig,
+    TestEvaluationMetrics,
+)
 from campus_hunt_cv.decision import DecisionEngine
 from campus_hunt_cv.embeddings_store import ReferenceEmbeddingsStore
 from campus_hunt_cv.image_validation import validate_and_decode_image
@@ -27,35 +36,35 @@ logger = logging.getLogger("calibrate")
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".JPG", ".JPEG", ".PNG", ".WEBP"}
 
 
-class ValidationDataset:
-    """Loads and computes scores for all labeled validation images."""
+class SplitDataset:
+    """Loads and computes scores for photos in a labeled split directory."""
 
     def __init__(
         self,
-        validation_dir: Path,
+        dataset_dir: Path,
         store: ReferenceEmbeddingsStore,
         embedder: OpenCLIPLocationEmbedder,
         scorer: SimilarityScorer,
+        split_name: str = "dataset",
     ):
-        self.validation_dir = Path(validation_dir)
+        self.dataset_dir = Path(dataset_dir)
         self.store = store
         self.embedder = embedder
         self.scorer = scorer
-        # List of dicts: {"actual": str, "file": str, "scores": Dict[str, float]}
+        self.split_name = split_name
         self.samples: List[Dict[str, Any]] = []
+        self.sample_counts: Dict[str, int] = defaultdict(int)
 
     def load_and_score(self) -> bool:
-        """Scan validation directory, embed images, and compute similarity scores."""
-        if not self.validation_dir.exists():
-            logger.error("Validation directory does not exist: %s", self.validation_dir)
+        """Scan directory, embed images, and compute similarity scores."""
+        if not self.dataset_dir.exists():
             return False
 
-        subdirs = [d for d in self.validation_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+        subdirs = [d for d in self.dataset_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
         if not subdirs:
-            logger.warning("No subdirectories found in '%s'.", self.validation_dir)
             return False
 
-        logger.info("Scanning validation directory '%s'...", self.validation_dir)
+        logger.info("Scanning %s directory '%s'...", self.split_name, self.dataset_dir)
 
         total_images = 0
         for sdir in sorted(subdirs):
@@ -77,30 +86,33 @@ class ValidationDataset:
                         "file": img_path.name,
                         "scores": scores,
                     })
+                    self.sample_counts[actual_label] += 1
                     total_images += 1
                 except Exception as e:
-                    logger.error("Failed processing validation image '%s': %s", img_path, str(e))
+                    logger.error("Failed processing %s image '%s': %s", self.split_name, img_path, str(e))
 
-        logger.info("Successfully evaluated %d validation captures.", total_images)
+        logger.info("Successfully evaluated %d %s captures.", total_images, self.split_name)
         return total_images > 0
 
 
 def evaluate_thresholds(
     samples: List[Dict[str, Any]],
-    all_locations: List[str],
+    store: ReferenceEmbeddingsStore,
     scorer: SimilarityScorer,
+    base_scoring_config: ScoringConfig,
     match_threshold: float,
     margin_threshold: float,
     mismatch_threshold: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Evaluate performance metrics for a specific (match_threshold, margin_threshold) pair."""
-    scoring_cfg = ScoringConfig(
-        calibrated=True,
-        match_threshold=match_threshold,
-        margin_threshold=margin_threshold,
-        mismatch_threshold=mismatch_threshold,
-    )
+    """Evaluate performance metrics for a candidate threshold pair using real reference counts."""
+    scoring_cfg = base_scoring_config.model_copy(update={
+        "calibrated": True,
+        "match_threshold": match_threshold,
+        "margin_threshold": margin_threshold,
+        "mismatch_threshold": mismatch_threshold,
+    })
     engine = DecisionEngine(config=scoring_cfg)
+    all_locations = store.locations
 
     correct_trials = 0
     correct_accepts = 0
@@ -111,7 +123,6 @@ def evaluate_thresholds(
     unknown_trials = 0
     unknown_rejections = 0
 
-    # For confusion matrix: actual -> predicted
     confusion_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
 
     for sample in samples:
@@ -120,7 +131,6 @@ def evaluate_thresholds(
         is_unknown = (actual == "unknown")
 
         if is_unknown:
-            # For unknown images, simulate testing against EVERY known hunt location
             for target_loc in all_locations:
                 unknown_trials += 1
                 (
@@ -132,6 +142,9 @@ def evaluate_thresholds(
                     margin,
                 ) = scorer.extract_ranking_and_margin(scores, target_location_id=target_loc)
 
+                # Use actual reference count from embeddings store
+                real_ref_count = store.get_location_count(target_loc)
+
                 decision, _ = engine.decide(
                     target_location_id=target_loc,
                     target_score=target_score,
@@ -140,7 +153,7 @@ def evaluate_thresholds(
                     best_competing_location_id=competing_id,
                     best_competing_score=competing_score,
                     margin=margin,
-                    target_ref_count=3,
+                    target_ref_count=real_ref_count,
                 )
 
                 if decision == "strong_match":
@@ -149,7 +162,6 @@ def evaluate_thresholds(
                     unknown_rejections += 1
             continue
 
-        # Positive evaluation: participant submitted photo for their actual location
         if actual in all_locations:
             correct_trials += 1
             (
@@ -161,6 +173,9 @@ def evaluate_thresholds(
                 margin,
             ) = scorer.extract_ranking_and_margin(scores, target_location_id=actual)
 
+            # Use actual reference count from embeddings store
+            real_ref_count = store.get_location_count(actual)
+
             decision, _ = engine.decide(
                 target_location_id=actual,
                 target_score=target_score,
@@ -169,7 +184,7 @@ def evaluate_thresholds(
                 best_competing_location_id=competing_id,
                 best_competing_score=competing_score,
                 margin=margin,
-                target_ref_count=3,
+                target_ref_count=real_ref_count,
             )
 
             predicted_label = best_match_id if decision == "strong_match" else f"unaccepted_{decision}"
@@ -178,7 +193,7 @@ def evaluate_thresholds(
             if decision == "strong_match":
                 correct_accepts += 1
 
-            # Cross-location trials: participant claims to be at wrong location L' != actual
+            # Cross-location trials: participant claims wrong location L' != actual
             for wrong_loc in all_locations:
                 if wrong_loc == actual:
                     continue
@@ -192,6 +207,8 @@ def evaluate_thresholds(
                     w_margin,
                 ) = scorer.extract_ranking_and_margin(scores, target_location_id=wrong_loc)
 
+                wrong_ref_count = store.get_location_count(wrong_loc)
+
                 w_decision, _ = engine.decide(
                     target_location_id=wrong_loc,
                     target_score=w_target_score,
@@ -200,7 +217,7 @@ def evaluate_thresholds(
                     best_competing_location_id=w_comp_id,
                     best_competing_score=w_comp_score,
                     margin=w_margin,
-                    target_ref_count=3,
+                    target_ref_count=wrong_ref_count,
                 )
 
                 if w_decision == "strong_match":
@@ -226,13 +243,17 @@ def evaluate_thresholds(
     }
 
 
-def print_confusion_matrix(confusion_counts: Dict[str, Dict[str, int]], locations: List[str]) -> None:
+def print_confusion_matrix(
+    confusion_counts: Dict[str, Dict[str, int]],
+    locations: List[str],
+    title: str = "PER-LOCATION CONFUSION MATRIX",
+) -> None:
     """Display formatted per-location confusion matrix."""
     header_cols = locations + ["rejected/ambiguous"]
     col_width = 16
 
     print("\n" + "=" * 80)
-    print("PER-LOCATION CONFUSION MATRIX")
+    print(title)
     print("=" * 80)
     print(f"{'Actual Location':<{col_width}} | " + " | ".join(f"{col:>{col_width}}" for col in header_cols))
     print("-" * 80)
@@ -254,8 +275,26 @@ def print_confusion_matrix(confusion_counts: Dict[str, Dict[str, int]], location
     print("=" * 80 + "\n")
 
 
+def check_calibration_data_adequacy(
+    store: ReferenceEmbeddingsStore,
+    sample_counts: Dict[str, int],
+    min_samples_per_location: int = 1,
+) -> Tuple[bool, List[str]]:
+    """Verify that calibration data contains sufficient samples across all hunt locations."""
+    missing: List[str] = []
+    for loc in store.locations:
+        if sample_counts.get(loc, 0) < min_samples_per_location:
+            missing.append(f"{loc} (count={sample_counts.get(loc, 0)})")
+
+    if sample_counts.get("unknown", 0) < 1:
+        missing.append("unknown (count=0)")
+
+    return (len(missing) == 0, missing)
+
+
 def run_calibration(
-    validation_dir: Path,
+    calibration_dir: Path,
+    test_dir: Path,
     embeddings_npz: Path,
     metadata_json: Path,
     output_config: Optional[Path] = None,
@@ -263,8 +302,9 @@ def run_calibration(
     candidate_margins: Optional[List[float]] = None,
     max_far: float = 0.02,
     device: str = "cpu",
-) -> None:
-    """Run threshold sweep and select optimal operating parameters."""
+    base_config: Optional[CampusHuntConfig] = None,
+) -> bool:
+    """Run threshold calibration on calibration data, then evaluate on test data."""
     if not embeddings_npz.exists() or not metadata_json.exists():
         logger.error(
             "Reference embeddings not found ('%s', '%s').\n"
@@ -272,41 +312,71 @@ def run_calibration(
             embeddings_npz,
             metadata_json,
         )
-        return
+        return False
 
-    store = ReferenceEmbeddingsStore.load(npz_path=embeddings_npz, metadata_path=metadata_json)
+    cfg = base_config or CampusHuntConfig.from_env()
+    model_name = cfg.model.model_name
+    pretrained = cfg.model.pretrained
+
+    try:
+        store = ReferenceEmbeddingsStore.load(
+            npz_path=embeddings_npz,
+            metadata_path=metadata_json,
+            expected_model_version=f"{model_name}/{pretrained}",
+        )
+    except Exception as e:
+        logger.error("Failed to load reference embeddings: %s", str(e))
+        return False
+
     model_cfg = ModelConfig(
-        model_name=store.metadata.get("model_name", "ViT-B-32"),
-        pretrained=store.metadata.get("pretrained", "laion2b_s34b_b79k"),
+        model_name=store.metadata.get("model_name", model_name),
+        pretrained=store.metadata.get("pretrained", pretrained),
         device=device,
     )
     embedder = OpenCLIPLocationEmbedder(config=model_cfg)
-    scorer = SimilarityScorer()
+    scorer = SimilarityScorer(config=cfg.scoring)
 
-    dataset = ValidationDataset(
-        validation_dir=validation_dir,
+    # 1. Load Calibration Dataset
+    calib_dataset = SplitDataset(
+        dataset_dir=calibration_dir,
         store=store,
         embedder=embedder,
         scorer=scorer,
+        split_name="calibration",
     )
 
-    loaded = dataset.load_and_score()
-    if not loaded:
+    if not calib_dataset.load_and_score():
         logger.error(
-            "No valid evaluation photos found in '%s'.\n"
-            "Data directory contract:\n"
-            "  data/validation/<actual_location_id>/*.jpg\n"
-            "  data/validation/unknown/*.jpg\n"
-            "Please collect real labeled validation photos before calibrating thresholds.",
-            validation_dir,
+            "No valid evaluation photos found in calibration directory '%s'.\n"
+            "Contract layout:\n"
+            "  data/calibration/<actual_location_id>/*.jpg\n"
+            "  data/calibration/unknown/*.jpg\n"
+            "Please collect real labeled calibration photos before calibrating thresholds.",
+            calibration_dir,
         )
-        return
+        return False
+
+    # Check adequacy of calibration captures
+    is_adequate, missing_locs = check_calibration_data_adequacy(
+        store=store,
+        sample_counts=calib_dataset.sample_counts,
+        min_samples_per_location=1,
+    )
+
+    if not is_adequate:
+        logger.error(
+            "Inadequate calibration data! Missing captures for: %s.\n"
+            "Thresholds cannot be calibrated without representative positive captures for all locations "
+            "and distractor photos in 'unknown/'. Calibrated config will NOT be written.",
+            ", ".join(missing_locs),
+        )
+        return False
 
     match_candidates = candidate_match_thresholds or [0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
     margin_candidates = candidate_margins or [0.00, 0.03, 0.05, 0.08, 0.10, 0.15]
 
     print("\n" + "=" * 80)
-    print("THRESHOLD & MARGIN CALIBRATION GRID SEARCH")
+    print("CALIBRATION SET THRESHOLD & MARGIN SEARCH (data/calibration/)")
     print("=" * 80)
     print(
         f"{'Match Thresh':<14} {'Margin':<10} {'Accept Rate':<14} {'False Accept (FAR)':<20} {'Unknown Reject':<16}"
@@ -320,11 +390,13 @@ def run_calibration(
     for m_th in match_candidates:
         for mg_th in margin_candidates:
             res = evaluate_thresholds(
-                samples=dataset.samples,
-                all_locations=store.locations,
+                samples=calib_dataset.samples,
+                store=store,
                 scorer=scorer,
+                base_scoring_config=cfg.scoring,
                 match_threshold=m_th,
                 margin_threshold=mg_th,
+                mismatch_threshold=None,
             )
             all_results.append(res)
             print(
@@ -335,7 +407,6 @@ def run_calibration(
                 f"{res['unknown_rejection_rate'] * 100:>14.1f}%"
             )
 
-            # Selection criteria: FAR <= max_far, high unknown reject, maximize accept rate
             if res["wrong_false_accept_rate"] <= max_far and res["unknown_rejection_rate"] >= 0.90:
                 if res["correct_accept_rate"] > best_accept_rate:
                     best_accept_rate = res["correct_accept_rate"]
@@ -351,31 +422,123 @@ def run_calibration(
         )
         best_config = min(all_results, key=lambda x: (x["wrong_false_accept_rate"], -x["correct_accept_rate"]))
 
-    print("CALIBRATION RECOMMENDATION:")
+    print("SELECTED THRESHOLDS (from calibration data):")
     print(f"  Selected Match Threshold:  {best_config['match_threshold']:.3f}")
     print(f"  Selected Margin Threshold: {best_config['margin_threshold']:.3f}")
-    print(f"  Correct Acceptance Rate:   {best_config['correct_accept_rate'] * 100:.1f}%")
-    print(f"  Wrong Location FAR:        {best_config['wrong_false_accept_rate'] * 100:.2f}%")
-    print(f"  Unknown Rejection Rate:    {best_config['unknown_rejection_rate'] * 100:.1f}%\n")
+    print(f"  Calibration Acceptance Rate:   {best_config['correct_accept_rate'] * 100:.1f}%")
+    print(f"  Calibration Wrong Location FAR:{best_config['wrong_false_accept_rate'] * 100:.2f}%")
+    print(f"  Calibration Unknown Rejection: {best_config['unknown_rejection_rate'] * 100:.1f}%\n")
 
-    print_confusion_matrix(best_config["confusion_counts"], store.locations)
+    print_confusion_matrix(best_config["confusion_counts"], store.locations, title="CALIBRATION CONFUSION MATRIX")
 
+    # 2. Separate Test Evaluation
+    test_dataset = SplitDataset(
+        dataset_dir=test_dir,
+        store=store,
+        embedder=embedder,
+        scorer=scorer,
+        split_name="test",
+    )
+    has_test_data = test_dataset.load_and_score()
+
+    test_eval_metadata: TestEvaluationMetrics
+
+    if not has_test_data:
+        print("!" * 80)
+        print("NOTICE: Final evaluation on independent test data is UNAVAILABLE.")
+        print(f"No test photos found in '{test_dir}'.")
+        print("Calibration metrics shown above must NOT be reported as independent test performance.")
+        print("Collect separate test photos to measure unbiased generalization accuracy.")
+        print("!" * 80 + "\n")
+
+        test_eval_metadata = TestEvaluationMetrics(
+            status="unavailable",
+            reason=f"No independent test captures found in '{test_dir}'.",
+        )
+    else:
+        test_res = evaluate_thresholds(
+            samples=test_dataset.samples,
+            store=store,
+            scorer=scorer,
+            base_scoring_config=cfg.scoring,
+            match_threshold=best_config["match_threshold"],
+            margin_threshold=best_config["margin_threshold"],
+            mismatch_threshold=None,
+        )
+
+        print("\n" + "=" * 80)
+        print("INDEPENDENT TEST SET EVALUATION (Unbiased generalization)")
+        print("=" * 80)
+        print(f"  Test Correct Acceptance Rate:  {test_res['correct_accept_rate'] * 100:.1f}%")
+        print(f"  Test Wrong Location FAR:       {test_res['wrong_false_accept_rate'] * 100:.2f}%")
+        print(f"  Test Unknown Rejection Rate:   {test_res['unknown_rejection_rate'] * 100:.1f}%")
+        print("=" * 80 + "\n")
+
+        print_confusion_matrix(test_res["confusion_counts"], store.locations, title="INDEPENDENT TEST CONFUSION MATRIX")
+
+        test_eval_metadata = TestEvaluationMetrics(
+            status="completed",
+            sample_counts=dict(test_dataset.sample_counts),
+            metrics=CalibrationMetrics(
+                correct_accept_rate=round(test_res["correct_accept_rate"], 4),
+                wrong_false_accept_rate=round(test_res["wrong_false_accept_rate"], 6),
+                unknown_rejection_rate=round(test_res["unknown_rejection_rate"], 4),
+                correct_trials=test_res["correct_trials"],
+                correct_accepts=test_res["correct_accepts"],
+                wrong_trials=test_res["wrong_trials"],
+                wrong_false_accepts=test_res["wrong_false_accepts"],
+                unknown_trials=test_res["unknown_trials"],
+                unknown_rejections=test_res["unknown_rejections"],
+            ),
+        )
+
+    # 3. Write compatible CampusHuntConfig JSON
     if output_config:
-        calib_data = {
-            "calibrated": True,
-            "match_threshold": round(best_config["match_threshold"], 4),
-            "margin_threshold": round(best_config["margin_threshold"], 4),
-            "mismatch_threshold": 0.30,
-            "model_version": store.model_version,
-            "validation_metrics": {
-                "correct_accept_rate": round(best_config["correct_accept_rate"], 4),
-                "wrong_false_accept_rate": round(best_config["wrong_false_accept_rate"], 6),
-                "unknown_rejection_rate": round(best_config["unknown_rejection_rate"], 4),
-            },
-        }
-        with open(output_config, "w", encoding="utf-8") as f:
-            json.dump(calib_data, f, indent=2)
-        logger.info("Saved calibrated threshold configuration to '%s'.", output_config)
+        calib_cfg = CampusHuntConfig(
+            model=ModelConfig(
+                model_name=store.metadata.get("model_name", model_name),
+                pretrained=store.metadata.get("pretrained", pretrained),
+                device=device,
+            ),
+            image_limits=cfg.image_limits,
+            scoring=ScoringConfig(
+                aggregation_method=cfg.scoring.aggregation_method,
+                top_k=cfg.scoring.top_k,
+                calibrated=True,
+                match_threshold=round(best_config["match_threshold"], 4),
+                margin_threshold=round(best_config["margin_threshold"], 4),
+                mismatch_threshold=None,  # Do not insert unvalidated mismatch threshold
+                min_reference_images_per_location=cfg.scoring.min_reference_images_per_location,
+            ),
+            storage=StorageConfig(
+                reference_data_dir=cfg.storage.reference_data_dir,
+                calibration_data_dir=calibration_dir,
+                test_data_dir=test_dir,
+                embeddings_path=embeddings_npz,
+                metadata_path=metadata_json,
+            ),
+            calibration_metadata=CalibrationMetadata(
+                model_version=store.model_version,
+                calibrated_at=datetime.now(timezone.utc).isoformat(),
+                calibration_sample_counts=dict(calib_dataset.sample_counts),
+                calibration_metrics=CalibrationMetrics(
+                    correct_accept_rate=round(best_config["correct_accept_rate"], 4),
+                    wrong_false_accept_rate=round(best_config["wrong_false_accept_rate"], 6),
+                    unknown_rejection_rate=round(best_config["unknown_rejection_rate"], 4),
+                    correct_trials=best_config["correct_trials"],
+                    correct_accepts=best_config["correct_accepts"],
+                    wrong_trials=best_config["wrong_trials"],
+                    wrong_false_accepts=best_config["wrong_false_accepts"],
+                    unknown_trials=best_config["unknown_trials"],
+                    unknown_rejections=best_config["unknown_rejections"],
+                ),
+                test_evaluation=test_eval_metadata,
+            ),
+        )
+        calib_cfg.to_json_file(output_config)
+        logger.info("Saved compatible calibrated configuration to '%s'.", output_config)
+
+    return True
 
 
 def main() -> None:
@@ -383,13 +546,25 @@ def main() -> None:
     cfg = CampusHuntConfig.from_env()
 
     parser = argparse.ArgumentParser(
-        description="Calibrate similarity and margin thresholds using labeled validation captures."
+        description="Calibrate similarity and margin thresholds using labeled calibration captures."
+    )
+    parser.add_argument(
+        "--calibration-dir",
+        type=Path,
+        default=None,
+        help="Path to labeled calibration images directory (default: data/calibration)",
     )
     parser.add_argument(
         "--validation-dir",
         type=Path,
-        default=cfg.storage.validation_data_dir,
-        help="Path to labeled validation images directory (default: data/validation)",
+        default=None,
+        help="Alias for --calibration-dir (backwards compatibility)",
+    )
+    parser.add_argument(
+        "--test-dir",
+        type=Path,
+        default=cfg.storage.test_data_dir,
+        help="Path to independent test images directory (default: data/test)",
     )
     parser.add_argument(
         "--embeddings-npz",
@@ -407,7 +582,7 @@ def main() -> None:
         "--output-config",
         type=Path,
         default=Path("calibrated_thresholds.json"),
-        help="Path to save recommended calibrated threshold configuration",
+        help="Path to save recommended calibrated configuration",
     )
     parser.add_argument(
         "--max-far",
@@ -419,19 +594,30 @@ def main() -> None:
         "--device",
         type=str,
         default=cfg.model.device,
-        help="Compute device for validation image embedding (default: cpu)",
+        help="Compute device for image embedding (default: cpu)",
     )
 
     args = parser.parse_args()
 
-    run_calibration(
-        validation_dir=args.validation_dir,
+    # Resolve calibration directory
+    calib_dir = args.calibration_dir or args.validation_dir or cfg.storage.calibration_data_dir
+    # If data/calibration doesn't exist but data/validation does, fallback gracefully
+    if not calib_dir.exists() and cfg.storage.validation_data_dir.exists():
+        calib_dir = cfg.storage.validation_data_dir
+
+    success = run_calibration(
+        calibration_dir=calib_dir,
+        test_dir=args.test_dir,
         embeddings_npz=args.embeddings_npz,
         metadata_json=args.metadata_json,
         output_config=args.output_config,
         max_far=args.max_far,
         device=args.device,
+        base_config=cfg,
     )
+
+    if not success:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

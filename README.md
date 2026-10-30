@@ -1,16 +1,16 @@
 # Campus Hunt CV: AI Location-Verification Component
 
-A robust, production-ready computer vision component for campus treasure hunts. It validates participant-submitted photos against reference imagery for campus riddle locations using OpenCLIP feature embeddings, cosine similarity, top-k aggregation, and calibrated threshold margins.
+A computer vision component for campus treasure hunts. It verifies participant-submitted photos against reference imagery for campus riddle locations using OpenCLIP feature embeddings, cosine similarity, top-$k$ mean aggregation, and calibrated threshold margins.
 
 ---
 
 ## 1. System Architecture & Scope
 
 ### Scope Boundary
-- **Included**: Raw image byte validation, safe decoding, OpenCLIP normalized feature extraction, precomputed reference embeddings management, cosine similarity scoring with top-k aggregation, margin calculation, conservative decision logic, and empirical threshold calibration.
+- **Included**: Raw image byte validation, safe decoding, OpenCLIP normalized feature extraction, precomputed reference embeddings management, cosine similarity scoring with top-$k$ aggregation, margin calculation, conservative decision logic, threshold calibration, and independent test evaluation.
 - **Excluded**: Web frontend, player authentication, database persistence, game progression logic, and external microservices.
 - **No Location Permissions / Geofencing**: This system strictly analyzes visual content. It does **not** use GPS, geolocation coordinates, device telemetry, or QR codes.
-- **Perceptual Match Only**: This component confirms whether a photo *appears to depict* a specific hunt location. It **never claims** that a photo proves physical presence or live capture (it does not detect printed photos or screens).
+- **Perceptual Match Only**: This component confirms whether a photo *appears to depict* a specific hunt location. It **never claims** that a photo proves physical presence or live capture (it does not detect printed photos or phone screen replays).
 
 ---
 
@@ -25,32 +25,38 @@ data/
       photo1.jpg
       photo2.jpg
       photo3.jpg
-    library_atrium/
-      ...
-    science_quad/
-      ...
-  validation/
+  calibration/
     <actual_location_id>/
-      test_capture1.jpg
-      test_capture2.jpg
+      calib_photo1.jpg
+      calib_photo2.jpg
     unknown/
       cafeteria.jpg
       dorm_hallway.jpg
       sidewalk.jpg
+  test/
+    <actual_location_id>/
+      test_photo1.jpg
+    unknown/
+      off_campus.jpg
+      parking_lot.jpg
 ```
 
-### Data Collection Rules:
-1. **Strict Train/Val Split**: Photos in `data/validation/` must be completely independent captures. **Never** copy or leak reference images into validation.
-2. **Diversity**: Reference and validation photos should be captured from multiple angles, varying distances, different smartphone cameras (iOS, Android), diverse lighting conditions (sunny, overcast, twilight), and realistic campus activity (pedestrians in background, backpacks).
+### Data Collection & Leakage Prevention Rules:
+1. **Three-Way Independent Split**:
+   - `data/reference/`: Used exclusively to build precomputed embeddings for all hunt locations.
+   - `data/calibration/`: Used exclusively by the calibration script to sweep candidate thresholds and margins.
+   - `data/test/`: Strict hold-out dataset evaluated once to measure unbiased generalization performance.
+   - **Never copy or leak images across reference, calibration, and test splits.** Photos must be independent captures, ideally collected across different capture sessions, days, and smartphone devices.
+2. **Diversity**: Reference, calibration, and test photos should be captured from multiple angles, varying distances, different mobile operating systems/sensors (iOS, Android), diverse lighting conditions (sunny, overcast, twilight), and realistic campus activity (pedestrians in background, backpacks).
 3. **`unknown/` Distractors**: Contains photos of non-hunt areas (dining halls, hallways, random trees, generic doors). These are essential to calibrate the unknown-image rejection rate and prevent false acceptances of off-target photos.
-4. **No Fabricated Data**: This repository provides directory scaffolding and documentation only. Embeddings and calibrated thresholds must be generated from real campus photos.
+4. **No Fabricated Data**: This repository provides directory scaffolding and documentation only. Embeddings, calibrated thresholds, and performance metrics must be generated from real campus photos.
 
 ---
 
 ## 3. Installation & Setup
 
 ### Prerequisites
-- Python 3.9+ (Python 3.11 recommended)
+- Python 3.10+
 - `pip` or [`uv`](https://github.com/astral-sh/uv)
 
 ### Setup Virtual Environment
@@ -59,11 +65,11 @@ data/
 # Clone and enter directory
 cd campus-hunt-cv
 
-# Create virtual environment
+# Create virtual environment (Python 3.10+)
 python3 -m venv .venv
 source .venv/bin/activate
 
-# Install package and dependencies
+# Install dependencies and editable package
 pip install -r requirements.txt
 pip install -e .
 ```
@@ -72,14 +78,13 @@ pip install -e .
 
 ## 4. Running on CPU (Resource & Latency Guide)
 
-The component is configured to run on **CPU by default**, eliminating the need for expensive GPU infrastructure or specialized cloud accelerators:
+The component is configured to run on **CPU by default**, eliminating the need for GPU infrastructure:
 
 - **Model**: `ViT-B-32` pretrained on `laion2b_s34b_b79k` (~340MB weights, ~600MB peak RAM).
 - **Inference Mode**: Inference runs under `torch.inference_mode()` with `model.eval()`.
-- **CPU Multi-threading**: PyTorch CPU threads can be tuned via `num_threads` in `ModelConfig` or via `torch.set_num_threads(N)`. On a modern multi-core CPU (e.g. 4–8 cores), inference takes ~30–70ms per image.
-- **No Vector Database Needed**: With 20–50 campus locations and 5 reference photos each (~100–250 total vectors of dimension 512), matrix dot product in NumPy takes **less than 0.2 milliseconds**. Adding an external vector database (Milvus, Pinecone, Qdrant) would add unnecessary operational overhead and network latency without any benefit at this scale.
-
-To leverage Apple Silicon GPU acceleration if available, set `device="mps"`. For NVIDIA CUDA GPUs, set `device="cuda"`. Set `device="auto"` for automatic detection.
+- **CPU Multi-threading**: PyTorch CPU threads can be configured via `num_threads` in `ModelConfig` or via `torch.set_num_threads(N)`. On a modern multi-core CPU (e.g. 4–8 cores), inference latency is estimated at ~30–70ms per image.
+- **In-Memory Dot Product**: For 20–50 campus locations with 3–5 reference photos each (~100–250 total 512D vectors), matrix dot product in NumPy takes **less than 0.2 milliseconds**. No vector database (Milvus, Pinecone, Qdrant) is required.
+- **Hardware Acceleration**: Set `device="mps"` for Apple Silicon or `device="cuda"` for NVIDIA GPUs. Use `device="auto"` for automatic detection with CPU fallback.
 
 ---
 
@@ -90,11 +95,13 @@ Embeddings are extracted once and saved into a safe, versioned pair:
    Contains stacked unit L2-normalized float32 embeddings `(N, D)` and associated string labels `(N,)`. Loaded strictly with `allow_pickle=False` to eliminate arbitrary code execution vulnerabilities.
 2. **JSON Metadata Companion (`.meta.json`)**:
    Contains schema version, model architecture name (`ViT-B-32`), weights tag (`laion2b_s34b_b79k`), feature dimension (512), timestamp, and per-location image counts and file names.
+3. **Model Version Compatibility Enforcement**:
+   When loading reference embeddings at runtime or calibration, the stored model architecture and weights tag are verified against the active embedder. If a mismatch is detected, the pipeline fails safely with `ERROR_MODEL_VERSION_MISMATCH` and refuses to silently compare incompatible feature spaces.
 
 ### Building Reference Embeddings
 
 ```bash
-# Command to scan data/reference/ and generate embeddings
+# Scan data/reference/ and generate embeddings
 campus-hunt-build-embeddings \
   --reference-dir data/reference \
   --output-npz data/reference_embeddings.npz \
@@ -106,22 +113,22 @@ campus-hunt-build-embeddings \
 
 ---
 
-## 6. Threshold Calibration & Validation
+## 6. Threshold Calibration & Hold-Out Evaluation
 
 ### Why Thresholds Cannot Be Hardcoded
-Cosine similarity scores depend heavily on:
-- Model architecture and checkpoint embedding space geometry.
-- Visual distinctiveness of campus landmarks (e.g., a gothic brick tower vs. an ultra-modern glass atrium).
-- Environmental variance (direct sunlight vs. rain).
+Cosine similarity distributions depend on:
+- Model checkpoint geometry.
+- Visual distinctiveness of campus landmarks (e.g. unique statues vs. similar brick building facades).
+- Environmental lighting and weather conditions.
 
-A generic threshold (e.g. `0.70`) is arbitrary and risky. Hardcoding it can lead to high false acceptance rates for distractors or false rejections of legitimate players.
+Hardcoding a generic threshold (e.g. `0.70`) is arbitrary and risks high false acceptance rates for distractors or false rejections of legitimate players.
 
-### Threshold Calibration Workflow
+### Calibration & Test Workflow
 
 ```bash
-# Evaluate labeled validation captures across a grid of thresholds and margins
 campus-hunt-calibrate \
-  --validation-dir data/validation \
+  --calibration-dir data/calibration \
+  --test-dir data/test \
   --embeddings-npz data/reference_embeddings.npz \
   --metadata-json data/reference_embeddings.meta.json \
   --output-config calibrated_thresholds.json \
@@ -129,12 +136,16 @@ campus-hunt-calibrate \
   --device cpu
 ```
 
-The script reports:
-1. **Correct-Location Acceptance Rate (TAR)**: % of actual location photos verified as `strong_match`.
-2. **Wrong-Location False Acceptance Rate (FAR)**: % of wrong location claims erroneously accepted as `strong_match`.
-3. **Unknown-Image Rejection Rate**: % of non-hunt photos correctly rejected for all hunt locations.
-4. **Per-Location Confusion Matrix**: Shows any visual confusion between similar campus spots.
-5. **Calibrated Configuration Output**: Saves recommended `match_threshold` and `margin_threshold` to `calibrated_thresholds.json`.
+### Process Details:
+1. **Calibration Split (`data/calibration/`)**:
+   - Sweeps candidate match thresholds and margins.
+   - Uses the **actual reference photo count** for each location from the embeddings store.
+   - Requires positive captures for all locations and distractor captures in `unknown/`. If calibration data is inadequate, the tool reports missing locations and **refuses to write an unvalidated calibrated config**.
+2. **Separate Hold-Out Test Split (`data/test/`)**:
+   - The selected thresholds are evaluated **once** on the independent test dataset.
+   - If `data/test/` is empty or has not been collected yet, the tool outputs an explicit notice that independent test evaluation is **unavailable**, and records `"status": "unavailable"` in the config metadata. Calibration metrics are never presented as test performance.
+3. **No Unmeasured Mismatch Threshold**:
+   - Calibration tunes `match_threshold` and `margin_threshold`. It does **not** insert an arbitrary, unvalidated `mismatch_threshold: 0.30`. `mismatch_threshold` defaults to `None`. Teams advance strictly on the conservative `strong_match` criteria.
 
 ---
 
@@ -156,7 +167,7 @@ verifier = LocationVerifier(config=config)
 # In the request handler:
 result = verify_location(
     image_bytes=uploaded_file_bytes,
-    target_location_id="clock_tower",  # from server game session!
+    target_location_id="clock_tower",  # Server-authoritative riddle location
     verifier=verifier,
 )
 ```
@@ -193,40 +204,75 @@ result = verify_location(
 
 ---
 
-## 8. Decision Logic & Conservative Safety Policy
+## 8. Calibrated Configuration JSON Format
 
-```mermaid
-flowchart TD
-    Start["Photo Submitted (image_bytes, target_location_id)"] --> CheckValid{"Image Valid & Decodable?"}
-    CheckValid -- No --> ErrImg["result = ambiguous\nreason = ERROR_IMAGE_*"]
-    CheckValid -- Yes --> CheckCalib{"Thresholds Calibrated?"}
-    CheckCalib -- No --> Uncalib["result = ambiguous\nreason = UNCALIBRATED_THRESHOLDS"]
-    CheckCalib -- Yes --> CheckTarget{"Target in Reference Set?"}
-    CheckTarget -- No --> UnkTarget["result = ambiguous\nreason = UNKNOWN_TARGET_LOCATION"]
-    CheckTarget -- Yes --> ComputeAll["Compute dot products with all locations\nTop-k mean score aggregation"]
-    ComputeAll --> TargetBest{"Is Target Best Match?"}
-    TargetBest -- Yes --> CheckThresholds{"Score >= match_th AND\nMargin >= margin_th?"}
-    CheckThresholds -- Yes --> StrongMatch["result = strong_match\nreason = STRONG_MATCH"]
-    CheckThresholds -- No --> AmbiguousMargin["result = ambiguous\nreason = AMBIGUOUS_*"]
-    TargetBest -- No --> CompetingDecisive{"Competitor >= match_th AND\nComp Margin >= margin_th?"}
-    CompetingDecisive -- Yes --> Mismatch["result = mismatch\nreason = MISMATCH_COMPETING_LOCATION_MATCHED"]
-    CompetingDecisive -- No --> TargetLow{"Target Score < mismatch_th?"}
-    TargetLow -- Yes --> MismatchLow["result = mismatch\nreason = MISMATCH_TARGET_SCORE_TOO_LOW"]
-    TargetLow -- No --> AmbiguousBorderline["result = ambiguous\nreason = AMBIGUOUS_BORDERLINE_COMPETITOR"]
+The configuration file written by `campus-hunt-calibrate` uses a nested structure that strictly matches `CampusHuntConfig` with `extra="forbid"`:
+
+```json
+{
+  "model": {
+    "model_name": "ViT-B-32",
+    "pretrained": "laion2b_s34b_b79k",
+    "device": "cpu",
+    "num_threads": null
+  },
+  "image_limits": {
+    "max_image_bytes": 15728640,
+    "max_image_pixels": 50000000,
+    "min_image_dimension": 32,
+    "allowed_formats": ["JPEG", "JPG", "PNG", "WEBP"]
+  },
+  "scoring": {
+    "aggregation_method": "top_k_mean",
+    "top_k": 3,
+    "calibrated": true,
+    "match_threshold": 0.65,
+    "margin_threshold": 0.08,
+    "mismatch_threshold": null,
+    "min_reference_images_per_location": 1
+  },
+  "storage": {
+    "reference_data_dir": "data/reference",
+    "calibration_data_dir": "data/calibration",
+    "test_data_dir": "data/test",
+    "embeddings_path": "data/reference_embeddings.npz",
+    "metadata_path": "data/reference_embeddings.meta.json"
+  },
+  "calibration_metadata": {
+    "model_version": "ViT-B-32/laion2b_s34b_b79k",
+    "calibrated_at": "2026-10-30T19:00:00Z",
+    "calibration_sample_counts": {
+      "clock_tower": 6,
+      "library_atrium": 5,
+      "unknown": 12
+    },
+    "calibration_metrics": {
+      "correct_accept_rate": 0.91,
+      "wrong_false_accept_rate": 0.01,
+      "unknown_rejection_rate": 0.95
+    },
+    "test_evaluation": {
+      "status": "unavailable",
+      "reason": "No independent test captures found in data/test/"
+    }
+  }
+}
 ```
-
-### Decision Rules:
-1. **Uncalibrated Safety Gate**: If `calibrated` is `False` or thresholds are `None`, the verifier **always** returns `"ambiguous"` with `reason_code="UNCALIBRATED_THRESHOLDS"`. It will never make up thresholds.
-2. **`strong_match`**: Requires `target_location_id == best_matching_location_id` **and** `target_score >= match_threshold` **and** `margin >= margin_threshold`.
-3. **`mismatch`**:
-   - A competing location is a decisive match (`best_matching_score >= match_threshold` and `best_matching_score - target_score >= margin_threshold`).
-   - Or `target_score < mismatch_threshold` (clearly unaligned photo).
-4. **`ambiguous`**: All borderline scores, narrow margins, ties, insufficient reference photos, or uncalibrated states.
-5. **Error Routing**: If image bytes are corrupted or model inference encounters an exception, the system returns `result="ambiguous"` with an `ERROR_...` reason code. The game backend can route this to manual staff review. **An AI error never turns into an unfair player failure.**
 
 ---
 
-## 9. Score Aggregation (Top-k Mean)
+## 9. Decision Logic & Conservative Policy
+
+### Decision Rules:
+1. **Uncalibrated Safety Gate**: If `calibrated` is `False` or thresholds are `None`, the verifier **always** returns `"ambiguous"` with `reason_code="UNCALIBRATED_THRESHOLDS"`. It will never guess or use arbitrary thresholds.
+2. **`strong_match`**: Requires `target_location_id == best_matching_location_id` **and** `target_score >= match_threshold` **and** `margin >= margin_threshold`.
+3. **`mismatch`**: Requires a competing location to decisively win (`best_matching_score >= match_threshold` and `best_matching_score - target_score >= margin_threshold`).
+4. **`ambiguous`**: All borderline scores, narrow margins, ties, insufficient reference photos, or uncalibrated states.
+5. **Error Routing**: If image bytes are corrupted, model weights mismatch, or inference fails, the system returns `result="ambiguous"` with an `ERROR_...` reason code (e.g. `ERROR_IMAGE_TOO_LARGE_BYTES`, `ERROR_MODEL_VERSION_MISMATCH`). The backend can route this to manual staff review. **An AI error is never turned into an unfair player failure.**
+
+---
+
+## 10. Score Aggregation (Top-$k$ Mean)
 
 For each location $L$ with $N_L$ reference photos:
 1. Compute cosine similarities between the submitted photo and each reference embedding:
@@ -235,16 +281,16 @@ For each location $L$ with $N_L$ reference photos:
    Take the mean of the top-$k$ highest similarities:
    $$\text{score}(L) = \frac{1}{k} \sum_{j=1}^k s_{(j)}$$
 3. **Safe Fallback ($0 < N_L < k$)**:
-   If fewer than $k$ reference photos are available, compute the arithmetic mean across all available $N_L$ photos:
+   If fewer than $k$ reference photos exist, compute the mean over all available $N_L$ photos:
    $$\text{score}(L) = \frac{1}{N_L} \sum_{j=1}^{N_L} s_j$$
-4. **Empty Case ($N_L = 0$)**:
-   Score is `None`; location is flagged with `INSUFFICIENT_REFERENCE_DATA`.
+4. **Insufficient Case ($N_L < \text{min\_reference\_images\_per\_location}$)**:
+   Score is returned as `ambiguous` with `reason_code="INSUFFICIENT_REFERENCE_DATA"`.
 
 ---
 
-## 10. When is Fine-Tuning Justified?
+## 11. When is Fine-Tuning Justified?
 
-Zero-shot OpenCLIP (`ViT-B-32`) already provides rich representations of architectural landmarks, sculptures, and campus facades. **Fine-tuning on small datasets is strongly discouraged** due to the high risk of catastrophic forgetting and overfitting to specific camera models or sunny weather.
+Zero-shot OpenCLIP (`ViT-B-32`) already provides rich representations of architectural landmarks, sculptures, and campus facades. Fine-tuning on small datasets is strongly discouraged due to the high risk of catastrophic forgetting and overfitting.
 
 Fine-tuning is **only worth considering** if all of the following conditions are met:
 1. **Data Volume**: At least **2,000 to 5,000+ labeled photos** across 30+ campus locations.
@@ -255,18 +301,17 @@ Fine-tuning is **only worth considering** if all of the following conditions are
 
 ---
 
-## 11. Testing
+## 12. Testing
 
-The test suite includes 47 fast, isolated unit tests that run completely offline without downloading model weights or requiring network access:
+The test suite includes 57 fast, isolated offline unit and regression tests:
 
 ```bash
-# Run unit tests
+# Run unit and regression tests
 pytest
 
 # Run with verbose output
 pytest -v
 
-# Run optional integration tests (downloads OpenCLIP weights)
+# Run optional integration smoke tests (downloads OpenCLIP weights)
 pytest -m integration
 ```
-

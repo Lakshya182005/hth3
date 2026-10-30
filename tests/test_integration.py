@@ -1,5 +1,11 @@
 """Integration tests requiring OpenCLIP model loading and forward pass.
 
+SOFTWARE SMOKE TESTS ONLY:
+These integration tests verify code execution plumbing and tensor shapes.
+They use trivial in-memory color squares and must NEVER be treated as calibration data,
+evaluation data, accuracy benchmarks, or campus performance metrics.
+Do not add synthetic images to data/ directories.
+
 These tests are marked with `@pytest.mark.integration` and are skipped during
 fast offline unit testing. Run with `pytest -m integration` to execute.
 """

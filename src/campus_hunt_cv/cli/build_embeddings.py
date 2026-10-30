@@ -6,7 +6,7 @@ import argparse
 import logging
 from pathlib import Path
 import sys
-from typing import Dict, List
+from typing import Dict, List, Optional
 import numpy as np
 
 from campus_hunt_cv.config import CampusHuntConfig, ModelConfig
@@ -30,7 +30,7 @@ def build_reference_embeddings(
     model_name: str = "ViT-B-32",
     pretrained: str = "laion2b_s34b_b79k",
     device: str = "cpu",
-    num_threads: int | None = None,
+    num_threads: Optional[int] = None,
 ) -> bool:
     """Scan reference directory, extract normalized embeddings, and save NPZ/JSON files."""
     reference_dir = Path(reference_dir)

@@ -1,25 +1,7 @@
-# Validation Images Directory
+# Validation Split (Legacy / Migration Notice)
 
-Place evaluation captures here to calibrate similarity thresholds and evaluate model discrimination accuracy.
+For rigorous machine learning evaluation, validation is now separated into two independent splits:
+1. `data/calibration/`: Used exclusively to sweep and select similarity and margin thresholds.
+2. `data/test/`: Used as a strict hold-out split to report unbiased test metrics.
 
-```
-data/validation/
-  ├── clock_tower/
-  │   ├── test_photo1.jpg
-  │   └── test_photo2.jpg
-  ├── library_atrium/
-  │   └── test_photo1.jpg
-  └── unknown/
-      ├── cafeteria_tray.jpg
-      ├── dorm_hallway.jpg
-      └── random_tree.jpg
-```
-
-## Structure:
-- `<actual_location_id>/`: Contains test captures taken at that actual campus location. Used to evaluate true positive acceptance rates and cross-location false acceptance rates.
-- `unknown/`: Contains photos taken at non-hunt campus locations, interiors, off-campus scenes, or generic objects that should NOT be accepted as any hunt location. Used to evaluate rejection rate of distractors.
-
-## Guidelines:
-1. **Strict Split**: Never reuse reference photos here. All images must be independent captures.
-2. **Realistic Variability**: Collect photos from varied phones, varying zoom levels, rainy/cloudy/sunny weather, and with slight occlusions (e.g., student bags, passing pedestrians).
-
+If files are present here, `campus-hunt-calibrate` will fall back to reading `data/validation/` if `data/calibration/` has not yet been populated. However, we strongly recommend placing calibration photos in `data/calibration/` and holdout evaluation captures in `data/test/`.

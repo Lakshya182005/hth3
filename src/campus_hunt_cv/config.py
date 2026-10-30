@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple
-from pydantic import BaseModel, Field, field_validator
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ImageLimitsConfig(BaseModel):
     """Limits and security constraints for image ingestion."""
+
+    model_config = ConfigDict(extra="forbid")
 
     max_image_bytes: int = Field(
         default=15 * 1024 * 1024,
@@ -35,6 +37,8 @@ class ImageLimitsConfig(BaseModel):
 
 class ModelConfig(BaseModel):
     """OpenCLIP model specification and execution settings."""
+
+    model_config = ConfigDict(extra="forbid")
 
     model_name: str = Field(
         default="ViT-B-32",
@@ -62,6 +66,8 @@ class ModelConfig(BaseModel):
 class ScoringConfig(BaseModel):
     """Configuration for similarity score aggregation and decision thresholds."""
 
+    model_config = ConfigDict(extra="forbid")
+
     aggregation_method: Literal["top_k_mean"] = Field(
         default="top_k_mean",
         description="Score aggregation method across reference photos for a location.",
@@ -74,7 +80,7 @@ class ScoringConfig(BaseModel):
     calibrated: bool = Field(
         default=False,
         description=(
-            "Must be set to True only after empirical calibration on labeled validation data. "
+            "Must be set to True only after empirical calibration on labeled calibration data. "
             "When False, the verifier safely defaults to 'ambiguous'."
         ),
     )
@@ -97,7 +103,7 @@ class ScoringConfig(BaseModel):
         default=None,
         description=(
             "Optional calibrated score below which a submission is confidently ruled as a mismatch, "
-            "provided a competing location dominates."
+            "provided a competing location dominates. Defaults to None unless empirically calibrated."
         ),
         ge=-1.0,
         le=1.0,
@@ -110,15 +116,21 @@ class ScoringConfig(BaseModel):
 
 
 class StorageConfig(BaseModel):
-    """File paths for reference images, validation images, and precomputed embeddings."""
+    """File paths for reference images, calibration captures, test captures, and embeddings."""
+
+    model_config = ConfigDict(extra="forbid")
 
     reference_data_dir: Path = Field(
         default=Path("data/reference"),
         description="Directory containing subdirectories of reference images per location.",
     )
-    validation_data_dir: Path = Field(
-        default=Path("data/validation"),
-        description="Directory containing subdirectories of validation captures (including unknown/).",
+    calibration_data_dir: Path = Field(
+        default=Path("data/calibration"),
+        description="Directory containing subdirectories of calibration captures (including unknown/).",
+    )
+    test_data_dir: Path = Field(
+        default=Path("data/test"),
+        description="Directory containing independent test captures (including unknown/) for final evaluation.",
     )
     embeddings_path: Path = Field(
         default=Path("data/reference_embeddings.npz"),
@@ -129,31 +141,65 @@ class StorageConfig(BaseModel):
         description="Path to JSON metadata companion for precomputed embeddings.",
     )
 
+    @property
+    def validation_data_dir(self) -> Path:
+        """Backwards-compatibility alias for calibration_data_dir."""
+        return self.calibration_data_dir
+
+
+class CalibrationMetrics(BaseModel):
+    """Performance metrics calculated on an evaluation split."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    correct_accept_rate: float = Field(ge=0.0, le=1.0)
+    wrong_false_accept_rate: float = Field(ge=0.0, le=1.0)
+    unknown_rejection_rate: float = Field(ge=0.0, le=1.0)
+    correct_trials: int = Field(default=0, ge=0)
+    correct_accepts: int = Field(default=0, ge=0)
+    wrong_trials: int = Field(default=0, ge=0)
+    wrong_false_accepts: int = Field(default=0, ge=0)
+    unknown_trials: int = Field(default=0, ge=0)
+    unknown_rejections: int = Field(default=0, ge=0)
+
+
+class TestEvaluationMetrics(BaseModel):
+    """Outcome and metrics of evaluation on the independent test dataset."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["completed", "unavailable"]
+    reason: Optional[str] = None
+    sample_counts: Optional[Dict[str, int]] = None
+    metrics: Optional[CalibrationMetrics] = None
+
+
+class CalibrationMetadata(BaseModel):
+    """Provenance and audit metadata for threshold calibration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_version: str
+    calibrated_at: str
+    calibration_sample_counts: Dict[str, int]
+    calibration_metrics: CalibrationMetrics
+    test_evaluation: TestEvaluationMetrics
+
 
 class CampusHuntConfig(BaseModel):
     """Unified configuration for the campus hunt verification pipeline."""
+
+    model_config = ConfigDict(extra="forbid")
 
     model: ModelConfig = Field(default_factory=ModelConfig)
     image_limits: ImageLimitsConfig = Field(default_factory=ImageLimitsConfig)
     scoring: ScoringConfig = Field(default_factory=ScoringConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
+    calibration_metadata: Optional[CalibrationMetadata] = None
 
     @classmethod
     def from_env(cls) -> CampusHuntConfig:
-        """Create configuration with environment variable overrides.
-
-        Supported environment variables:
-          - CAMPUS_HUNT_MODEL_NAME (str)
-          - CAMPUS_HUNT_PRETRAINED (str)
-          - CAMPUS_HUNT_DEVICE (str)
-          - CAMPUS_HUNT_TOP_K (int)
-          - CAMPUS_HUNT_CALIBRATED (bool: "1", "true", "yes")
-          - CAMPUS_HUNT_MATCH_THRESHOLD (float)
-          - CAMPUS_HUNT_MARGIN_THRESHOLD (float)
-          - CAMPUS_HUNT_MISMATCH_THRESHOLD (float)
-          - CAMPUS_HUNT_EMBEDDINGS_PATH (path)
-          - CAMPUS_HUNT_METADATA_PATH (path)
-        """
+        """Create configuration with environment variable overrides."""
         cfg = cls()
 
         if "CAMPUS_HUNT_MODEL_NAME" in os.environ:
@@ -180,14 +226,17 @@ class CampusHuntConfig(BaseModel):
         return cfg
 
     @classmethod
-    def from_json_file(cls, path: str | Path) -> CampusHuntConfig:
-        """Load configuration from a JSON file."""
+    def from_json_file(cls, path: Union[str, Path]) -> CampusHuntConfig:
+        """Load configuration from a documented JSON file.
+
+        Enforces strict schema validation (`extra='forbid'`) so misplaced or
+        unknown calibration fields are immediately flagged rather than silently ignored.
+        """
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         return cls.model_validate(data)
 
-    def to_json_file(self, path: str | Path) -> None:
+    def to_json_file(self, path: Union[str, Path]) -> None:
         """Persist configuration to a formatted JSON file."""
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.model_dump(mode="json"), f, indent=2)
-

@@ -264,14 +264,15 @@ class ReferenceEmbeddingsStore:
                 reason_code="ERROR_EMBEDDING_LABEL_MISMATCH",
             )
 
-        # Optional model version check
+        # Model version compatibility check
         stored_version = f"{metadata.get('model_name')}/{metadata.get('pretrained')}"
         if expected_model_version and stored_version != expected_model_version:
-            logger.warning(
-                "Reference embeddings were generated with model '%s', but current model is '%s'. "
-                "Embeddings should be regenerated with the matching model checkpoint.",
-                stored_version,
-                expected_model_version,
+            raise ReferenceDataError(
+                f"Model version mismatch: embeddings were generated with '{stored_version}', "
+                f"but runtime model version is '{expected_model_version}'. "
+                "Incompatible embeddings cannot be compared. "
+                "Regenerate embeddings with `campus-hunt-build-embeddings` using the matching model.",
+                reason_code="ERROR_MODEL_VERSION_MISMATCH",
             )
 
         # Group embeddings by location_id

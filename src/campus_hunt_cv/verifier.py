@@ -95,9 +95,17 @@ class LocationVerifier:
                 lazy_load=False,
             )
 
+        self._store_load_error: Optional[ReferenceDataError] = None
+
         # Reference embeddings store
         if store is not None:
             self.store = store
+            if self.store.model_version != self.embedder.model_version:
+                logger.error(
+                    "Store model version '%s' does not match embedder model version '%s'.",
+                    self.store.model_version,
+                    self.embedder.model_version,
+                )
         else:
             self.store = self._try_load_store()
 
@@ -105,17 +113,24 @@ class LocationVerifier:
         self.decision_engine = DecisionEngine(config=self.config.scoring)
 
     def _try_load_store(self) -> Optional[ReferenceEmbeddingsStore]:
-        """Attempt to load embeddings from disk; return None if files do not exist yet."""
+        """Attempt to load embeddings from disk; record error if incompatible."""
         npz_p = self.config.storage.embeddings_path
         meta_p = self.config.storage.metadata_path
         if npz_p.exists() and meta_p.exists():
             try:
-                return ReferenceEmbeddingsStore.load(
+                store = ReferenceEmbeddingsStore.load(
                     npz_path=npz_p,
                     metadata_path=meta_p,
                     expected_model_version=self.embedder.model_version,
                 )
+                self._store_load_error = None
+                return store
+            except ReferenceDataError as e:
+                self._store_load_error = e
+                logger.error("Failed to load reference embeddings: %s", e.message)
+                return None
             except Exception as e:
+                self._store_load_error = ReferenceDataError(str(e))
                 logger.error("Failed to load reference embeddings from disk: %s", str(e))
                 return None
         return None
@@ -145,7 +160,8 @@ class LocationVerifier:
             # Re-attempt loading in case files were generated after initialization
             self.store = self._try_load_store()
 
-        if self.store is None or len(self.store.locations) == 0:
+        # Enforce model version compatibility: never silently compare incompatible embeddings
+        if self.store is not None and self.store.model_version != self.embedder.model_version:
             return VerificationResponse(
                 result="ambiguous",
                 target_score=None,
@@ -154,7 +170,25 @@ class LocationVerifier:
                 best_competing_location_id=None,
                 best_competing_score=None,
                 margin=None,
-                reason_code="ERROR_NO_REFERENCE_DATA_LOADED",
+                reason_code="ERROR_MODEL_VERSION_MISMATCH",
+                model_version=model_version,
+            ).model_dump()
+
+        if self.store is None or len(self.store.locations) == 0:
+            reason = (
+                self._store_load_error.reason_code
+                if self._store_load_error is not None
+                else "ERROR_NO_REFERENCE_DATA_LOADED"
+            )
+            return VerificationResponse(
+                result="ambiguous",
+                target_score=None,
+                best_matching_location_id=None,
+                best_matching_score=None,
+                best_competing_location_id=None,
+                best_competing_score=None,
+                margin=None,
+                reason_code=reason,
                 model_version=model_version,
             ).model_dump()
 
