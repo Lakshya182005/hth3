@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "campus-hunt-cv"
+version = "0.1.0"
+description = "AI location-verification component for campus treasure hunt using OpenCLIP similarity"
+authors = [
+    { name = "Campus Hunt Engineering Team" }
+]
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0.0,<3.0.0",
+    "torchvision>=0.15.0,<1.0.0",
+    "open-clip-torch>=2.20.0,<4.0.0",
+    "pillow>=9.0.0,<14.0.0",
+    "numpy>=1.22.0,<3.0.0",
+    "pydantic>=2.0.0,<3.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+]
+
+[project.scripts]
+campus-hunt-build-embeddings = "campus_hunt_cv.cli.build_embeddings:main"
+campus-hunt-calibrate = "campus_hunt_cv.cli.calibrate:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not integration'"
+markers = [
+    "integration: marks tests requiring model weights download or full inference (run with '-m integration')",
+]
