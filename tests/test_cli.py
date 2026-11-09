@@ -4,7 +4,12 @@ from pathlib import Path
 import pytest
 
 from campus_hunt_cv.cli.build_embeddings import build_reference_embeddings
-from campus_hunt_cv.cli.calibrate import evaluate_thresholds, print_confusion_matrix
+from campus_hunt_cv.cli.calibrate import (
+    evaluate_thresholds,
+    format_cross_location_errors,
+    format_focused_confusion_report,
+    print_confusion_matrix,
+)
 from campus_hunt_cv.config import ScoringConfig
 from campus_hunt_cv.similarity import SimilarityScorer
 
@@ -164,6 +169,18 @@ def test_evaluate_thresholds_and_confusion_matrix_identifies_misclassifications(
     # Cross-location false acceptance occurred
     assert metrics["wrong_false_accepts"] == 1
     assert metrics["confusion_counts"]["clock_tower"]["library_atrium"] == 1
+    # Must NOT double-count the misclassified capture as unaccepted
+    assert metrics["confusion_counts"]["clock_tower"].get("unaccepted_mismatch", 0) == 0
+    assert sum(metrics["confusion_counts"]["clock_tower"].values()) == 1
+    assert len(metrics["cross_location_false_acceptances"]) == 1
+    err = metrics["cross_location_false_acceptances"][0]
+    assert err["actual_location"] == "clock_tower"
+    assert err["claimed_location"] == "library_atrium"
+    assert err["best_matching_location"] == "library_atrium"
+    assert err["target_score"] == 0.85
+    assert err["competing_score"] == 0.40
+    assert round(err["margin"], 2) == 0.45
+    assert err["decision"] == "strong_match"
 
     print_confusion_matrix(
         confusion_counts=metrics["confusion_counts"],
@@ -173,6 +190,48 @@ def test_evaluate_thresholds_and_confusion_matrix_identifies_misclassifications(
     captured = capsys.readouterr().out
     assert "MISCLASSIFICATIONS DETECTED (Cross-Location False Acceptances):" in captured
     assert "Actual 'clock_tower' misclassified as competing location 'library_atrium': 1 capture(s)" in captured
+
+
+def test_format_cross_location_errors_and_focused_report():
+    """Verify that cross-location error details and focused report contain all required fields."""
+    mock_errors = [
+        {
+            "image_path": "data/test/4th_floor_near_robotics_lab/IMG20261103184842.jpg",
+            "actual_location": "4th_floor_near_robotics_lab",
+            "claimed_location": "a_block_near_313",
+            "best_matching_location": "a_block_near_313",
+            "target_score": 0.6190,
+            "competing_score": 0.6046,
+            "margin": 0.0144,
+            "decision": "strong_match",
+        }
+    ]
+
+    err_report = format_cross_location_errors(mock_errors, split_name="TEST")
+    assert "Relative Image Path:    data/test/4th_floor_near_robotics_lab/IMG20261103184842.jpg" in err_report
+    assert "Actual Location:        4th_floor_near_robotics_lab" in err_report
+    assert "Claimed Location:       a_block_near_313" in err_report
+    assert "Best-Matching Location: a_block_near_313" in err_report
+    assert "Target Score:           0.6190" in err_report
+    assert "Competing Score:        0.6046" in err_report
+    assert "Margin:                 0.0144" in err_report
+    assert "Decision Result:        strong_match" in err_report
+
+    focused_report = format_focused_confusion_report(
+        mock_errors, "4th_floor_near_robotics_lab", "a_block_near_313"
+    )
+    assert "FOCUSED CONFUSION REPORT: '4th_floor_near_robotics_lab' <--> 'a_block_near_313'" in focused_report
+    assert "Target Location Pair:   '4th_floor_near_robotics_lab' <--> 'a_block_near_313'" in focused_report
+    assert "Identified Incidents:   1" in focused_report
+    assert "Relative Image Path:    data/test/4th_floor_near_robotics_lab/IMG20261103184842.jpg" in focused_report
+    assert "Actual Location:        4th_floor_near_robotics_lab" in focused_report
+    assert "Claimed Location:       a_block_near_313" in focused_report
+    assert "Root-Cause & Operational Assessment" in focused_report
+
+    # When no incidents match the pair
+    empty_focused = format_focused_confusion_report([], "loc_x", "loc_y")
+    assert "No cross-location false acceptances detected" in empty_focused
+
 
 
 

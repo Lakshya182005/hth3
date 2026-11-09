@@ -14,6 +14,7 @@ from campus_hunt_cv.cli.calibrate import (
     check_split_data_adequacy,
     evaluate_thresholds,
     main as calibrate_main,
+    print_confusion_matrix,
     run_calibration,
 )
 from campus_hunt_cv.config import (
@@ -1188,6 +1189,56 @@ def test_provisional_warning_genuinely_lowered_counts(tmp_path: Path, monkeypatc
     assert loaded.calibration_metadata.test_evaluation.metrics.unknown_rejection_rate is not None
 
 
+def test_calibration_generates_error_report_file(tmp_path: Path, monkeypatch):
+    """When error_report is provided to run_calibration, it generates a detailed inspection report."""
+    calib_dir = tmp_path / "calib"
+    test_dir = tmp_path / "test"
+    out_cfg = tmp_path / "calib_out.json"
+    err_report_path = tmp_path / "error_report.txt"
+    npz_path = tmp_path / "emb.npz"
+    meta_path = tmp_path / "meta.json"
+
+    dim = 64
+    ReferenceEmbeddingsStore.save(
+        npz_path=npz_path,
+        metadata_path=meta_path,
+        embeddings_by_location={"loc_a": np.ones((1, dim), dtype=np.float32)},
+        model_name="ViT-B-32",
+        pretrained="mock_test",
+    )
+    populate_split(calib_dir, {"loc_a": 5})
+    populate_split(test_dir, {"loc_a": 5})
+
+    mock_emb = MockEmbedder(dimension=dim)
+    monkeypatch.setattr("campus_hunt_cv.cli.calibrate.OpenCLIPLocationEmbedder", lambda config: mock_emb)
+
+    base_cfg = CampusHuntConfig(
+        model=ModelConfig(model_name="ViT-B-32", pretrained="mock_test", device="cpu"),
+    )
+
+    success = run_calibration(
+        calibration_dir=calib_dir,
+        test_dir=test_dir,
+        embeddings_npz=npz_path,
+        metadata_json=meta_path,
+        output_config=out_cfg,
+        error_report=err_report_path,
+        max_far=1.0,
+        min_unknown_rejection=0.0,
+        allow_missing_unknown=True,
+        base_config=base_cfg,
+    )
+
+    assert success is True
+    assert err_report_path.exists()
+    content = err_report_path.read_text(encoding="utf-8")
+    assert "# CAMPUS HUNT CV - CALIBRATION & TEST ERROR REPORT" in content
+    assert "CROSS-LOCATION FALSE ACCEPTANCE DETAILS (CALIBRATION SPLIT)" in content
+    assert "CROSS-LOCATION FALSE ACCEPTANCE DETAILS (TEST SPLIT)" in content
+    assert "FOCUSED CONFUSION REPORT: '4th_floor_near_robotics_lab' <--> 'a_block_near_313'" in content
+
+
+
 def test_inadequate_calibration_does_not_create_or_overwrite_active_config(tmp_path: Path, monkeypatch):
     """Inadequate calibration data must not create a config or overwrite an existing active config."""
     calib_dir = tmp_path / "calib"
@@ -1767,5 +1818,142 @@ def test_normalize_environment_safeguards():
     assert normalize_environment("staging") == "production"
     assert normalize_environment("unknown_env") == "production"
     assert normalize_environment(123) == "production"
+
+
+def test_confusion_matrix_accounting_exact_single_outcome_per_capture(capsys):
+    """Assert that every evaluated capture contributes to exactly ONE confusion-matrix outcome.
+
+    Regression test for double-counting bug where a capture triggering a cross-location
+    false acceptance was counted twice in its row (once as unaccepted_mismatch, and once as the
+    wrong claimed location), causing row total to be N+1 and the grand total to exceed the
+    number of evaluated captures.
+    """
+    scorer = SimilarityScorer()
+    scoring_config = ScoringConfig(min_reference_images_per_location=1)
+    locations = ["loc_a", "loc_b", "loc_c"]
+
+    # Build reference store with 3 locations
+    dim = 64
+    store = ReferenceEmbeddingsStore(
+        embeddings_by_location={
+            "loc_a": np.ones((5, dim), dtype=np.float32),
+            "loc_b": np.ones((5, dim), dtype=np.float32),
+            "loc_c": np.ones((5, dim), dtype=np.float32),
+        },
+        metadata={"model_name": "ViT-B-32", "pretrained": "mock_test"},
+    )
+
+    samples = [
+        # loc_a: 5 captures (4 strong matches, 1 ambiguous/rejected)
+        {"actual": "loc_a", "file": "a1.jpg", "scores": {"loc_a": 0.85, "loc_b": 0.30, "loc_c": 0.20}},
+        {"actual": "loc_a", "file": "a2.jpg", "scores": {"loc_a": 0.82, "loc_b": 0.25, "loc_c": 0.22}},
+        {"actual": "loc_a", "file": "a3.jpg", "scores": {"loc_a": 0.80, "loc_b": 0.28, "loc_c": 0.24}},
+        {"actual": "loc_a", "file": "a4.jpg", "scores": {"loc_a": 0.78, "loc_b": 0.22, "loc_c": 0.21}},
+        {"actual": "loc_a", "file": "a5.jpg", "scores": {"loc_a": 0.45, "loc_b": 0.35, "loc_c": 0.30}},  # Ambiguous
+
+        # loc_b: 5 captures (4 strong matches, 1 cross-location false acceptance to loc_c)
+        {"actual": "loc_b", "file": "b1.jpg", "scores": {"loc_a": 0.20, "loc_b": 0.86, "loc_c": 0.30}},
+        {"actual": "loc_b", "file": "b2.jpg", "scores": {"loc_a": 0.22, "loc_b": 0.84, "loc_c": 0.28}},
+        {"actual": "loc_b", "file": "b3.jpg", "scores": {"loc_a": 0.25, "loc_b": 0.81, "loc_c": 0.25}},
+        {"actual": "loc_b", "file": "b4.jpg", "scores": {"loc_a": 0.21, "loc_b": 0.79, "loc_c": 0.29}},
+        {"actual": "loc_b", "file": "b5.jpg", "scores": {"loc_a": 0.30, "loc_b": 0.40, "loc_c": 0.82}},  # Accepted as loc_c
+
+        # loc_c: 5 captures (5 strong matches)
+        {"actual": "loc_c", "file": "c1.jpg", "scores": {"loc_a": 0.18, "loc_b": 0.22, "loc_c": 0.88}},
+        {"actual": "loc_c", "file": "c2.jpg", "scores": {"loc_a": 0.20, "loc_b": 0.25, "loc_c": 0.85}},
+        {"actual": "loc_c", "file": "c3.jpg", "scores": {"loc_a": 0.19, "loc_b": 0.21, "loc_c": 0.83}},
+        {"actual": "loc_c", "file": "c4.jpg", "scores": {"loc_a": 0.22, "loc_b": 0.24, "loc_c": 0.81}},
+        {"actual": "loc_c", "file": "c5.jpg", "scores": {"loc_a": 0.21, "loc_b": 0.23, "loc_c": 0.80}},
+    ]
+
+    metrics = evaluate_thresholds(
+        samples=samples,
+        store=store,
+        scorer=scorer,
+        base_scoring_config=scoring_config,
+        match_threshold=0.60,
+        margin_threshold=0.08,
+    )
+
+    conf = metrics["confusion_counts"]
+
+    # Per-location sample counts
+    expected_counts = {"loc_a": 5, "loc_b": 5, "loc_c": 5}
+    total_evaluated = len(samples)
+
+    # 1. Assert row totals equal evaluated sample counts for each location
+    grand_total = 0
+    for loc, expected_n in expected_counts.items():
+        loc_row_counts = conf[loc]
+        # Sum of predicted location columns
+        predicted_loc_sum = sum(loc_row_counts.get(col, 0) for col in locations)
+        # Sum of rejected/ambiguous column
+        rejected_sum = sum(cnt for k, cnt in loc_row_counts.items() if k.startswith("unaccepted_"))
+        row_total = predicted_loc_sum + rejected_sum
+        assert row_total == expected_n, f"Row total for '{loc}' was {row_total}, expected {expected_n}"
+        grand_total += row_total
+
+    # 2. Assert grand total equals total evaluated captures (15)
+    assert grand_total == total_evaluated
+
+    # 3. Assert specific breakdown for the row with false acceptance (loc_b)
+    # 4 correct matches + 1 wrong match (loc_c) + 0 rejected/ambiguous = 5 total
+    assert conf["loc_b"]["loc_b"] == 4
+    assert conf["loc_b"]["loc_c"] == 1
+    assert conf["loc_b"].get("unaccepted_mismatch", 0) == 0
+    assert conf["loc_b"].get("unaccepted_ambiguous", 0) == 0
+
+    # 4. Assert specific breakdown for loc_a (4 correct + 1 ambiguous = 5 total)
+    assert conf["loc_a"]["loc_a"] == 4
+    assert conf["loc_a"]["unaccepted_ambiguous"] == 1
+
+    # 5. Assert specific breakdown for loc_c (5 correct = 5 total)
+    assert conf["loc_c"]["loc_c"] == 5
+
+    # 6. Verify cross-location false acceptance reporting has exact details and does NOT duplicate counts
+    assert len(metrics["cross_location_false_acceptances"]) == 1
+    fa = metrics["cross_location_false_acceptances"][0]
+    assert fa["actual_location"] == "loc_b"
+    assert fa["claimed_location"] == "loc_c"
+    assert fa["best_matching_location"] == "loc_c"
+    assert fa["decision"] == "strong_match"
+
+    # 7. Print confusion matrix and verify formatted output
+    print_confusion_matrix(conf, locations, title="TEST CONFUSION MATRIX")
+    captured = capsys.readouterr().out
+    assert "MISCLASSIFICATIONS DETECTED (Cross-Location False Acceptances):" in captured
+    assert "Actual 'loc_b' misclassified as competing location 'loc_c': 1 capture(s)" in captured
+
+    # 8. Test with unknown samples to verify row total accounting extends to unknown captures
+    samples_with_unk = list(samples) + [
+        {"actual": "unknown", "file": "u1.jpg", "scores": {"loc_a": 0.20, "loc_b": 0.25, "loc_c": 0.22}},
+        {"actual": "unknown", "file": "u2.jpg", "scores": {"loc_a": 0.30, "loc_b": 0.35, "loc_c": 0.28}},
+        {"actual": "unknown", "file": "u3.jpg", "scores": {"loc_a": 0.85, "loc_b": 0.30, "loc_c": 0.20}},  # False accept as loc_a
+    ]
+    unk_metrics = evaluate_thresholds(
+        samples=samples_with_unk,
+        store=store,
+        scorer=scorer,
+        base_scoring_config=scoring_config,
+        match_threshold=0.60,
+        margin_threshold=0.08,
+    )
+    unk_conf = unk_metrics["confusion_counts"]
+    unk_predicted_sum = sum(unk_conf["unknown"].get(col, 0) for col in locations)
+    unk_rejected_sum = sum(cnt for k, cnt in unk_conf["unknown"].items() if k.startswith("unaccepted_"))
+    unk_row_total = unk_predicted_sum + unk_rejected_sum
+    assert unk_row_total == 3
+    assert unk_conf["unknown"]["loc_a"] == 1
+    assert unk_conf["unknown"]["unaccepted_rejected"] == 2
+
+    # Grand total across all 4 rows
+    all_rows_total = 0
+    for act in ["loc_a", "loc_b", "loc_c", "unknown"]:
+        r_sum = sum(unk_conf[act].get(col, 0) for col in locations) + sum(
+            cnt for k, cnt in unk_conf[act].items() if k.startswith("unaccepted_")
+        )
+        all_rows_total += r_sum
+    assert all_rows_total == len(samples_with_unk) == 18
+
 
 

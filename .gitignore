@@ -58,3 +58,9 @@ data/*.csv
 # OS files
 .DS_Store
 
+# Reports
+reports/
+*confusion_report*
+*error_report*
+
+

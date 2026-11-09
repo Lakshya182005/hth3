@@ -86,9 +86,14 @@ class SplitDataset:
                         query_embedding=emb,
                         embeddings_by_location=self.store.all_embeddings_by_location,
                     )
+                    try:
+                        rel_path = str(img_path.relative_to(Path.cwd()))
+                    except Exception:
+                        rel_path = f"{self.split_name}/{actual_label}/{img_path.name}"
                     self.samples.append({
                         "actual": actual_label,
                         "file": img_path.name,
+                        "relative_path": rel_path,
                         "scores": scores,
                     })
                     self.sample_counts[actual_label] += 1
@@ -129,6 +134,7 @@ def evaluate_thresholds(
     unknown_rejections = 0
 
     confusion_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    cross_location_false_acceptances: List[Dict[str, Any]] = []
 
     for sample in samples:
         actual = sample["actual"]
@@ -136,6 +142,8 @@ def evaluate_thresholds(
         is_unknown = (actual == "unknown")
 
         if is_unknown:
+            best_accepted_unk_loc: Optional[str] = None
+            best_unk_score: float = -1.0
             for target_loc in all_locations:
                 unknown_trials += 1
                 (
@@ -162,9 +170,16 @@ def evaluate_thresholds(
                 )
 
                 if decision == "strong_match":
-                    confusion_counts["unknown"][target_loc] += 1
+                    if best_accepted_unk_loc is None or (target_score is not None and target_score > best_unk_score):
+                        best_accepted_unk_loc = target_loc
+                        best_unk_score = target_score if target_score is not None else 0.0
                 else:
                     unknown_rejections += 1
+
+            if best_accepted_unk_loc is not None:
+                confusion_counts["unknown"][best_accepted_unk_loc] += 1
+            else:
+                confusion_counts["unknown"]["unaccepted_rejected"] += 1
             continue
 
         if actual in all_locations:
@@ -192,13 +207,12 @@ def evaluate_thresholds(
                 target_ref_count=real_ref_count,
             )
 
-            predicted_label = best_match_id if decision == "strong_match" else f"unaccepted_{decision}"
-            confusion_counts[actual][predicted_label] += 1
-
             if decision == "strong_match":
                 correct_accepts += 1
 
             # Cross-location trials: participant claims wrong location L' != actual
+            best_accepted_wrong_loc: Optional[str] = None
+            best_accepted_wrong_score: float = -1.0
             for wrong_loc in all_locations:
                 if wrong_loc == actual:
                     continue
@@ -227,7 +241,36 @@ def evaluate_thresholds(
 
                 if w_decision == "strong_match":
                     wrong_false_accepts += 1
-                    confusion_counts[actual][wrong_loc] += 1
+                    if best_accepted_wrong_loc is None or (w_target_score is not None and w_target_score > best_accepted_wrong_score):
+                        best_accepted_wrong_loc = wrong_loc
+                        best_accepted_wrong_score = w_target_score if w_target_score is not None else 0.0
+
+                    img_rel_path = (
+                        sample.get("relative_path")
+                        or sample.get("path")
+                        or (f"{actual}/{sample['file']}" if "file" in sample else "unknown")
+                    )
+                    cross_location_false_acceptances.append({
+                        "image_path": img_rel_path,
+                        "actual_location": actual,
+                        "claimed_location": wrong_loc,
+                        "best_matching_location": w_best_id,
+                        "target_score": round(w_target_score, 4) if w_target_score is not None else None,
+                        "competing_score": round(w_comp_score, 4) if w_comp_score is not None else None,
+                        "margin": round(w_margin, 4) if w_margin is not None else None,
+                        "decision": w_decision,
+                    })
+
+            # Each evaluated capture contributes to exactly ONE confusion-matrix outcome:
+            # - correct predicted location;
+            # - wrong predicted location (cross-location false acceptance); OR
+            # - rejected/ambiguous.
+            if decision == "strong_match":
+                confusion_counts[actual][actual] += 1
+            elif best_accepted_wrong_loc is not None:
+                confusion_counts[actual][best_accepted_wrong_loc] += 1
+            else:
+                confusion_counts[actual][f"unaccepted_{decision}"] += 1
 
     accept_rate = (correct_accepts / correct_trials) if correct_trials > 0 else 0.0
     far = (wrong_false_accepts / wrong_trials) if wrong_trials > 0 else 0.0
@@ -253,6 +296,7 @@ def evaluate_thresholds(
         "unknown_trials": unk_trials_val,
         "unknown_rejections": unk_rejections_val,
         "confusion_counts": confusion_counts,
+        "cross_location_false_acceptances": cross_location_false_acceptances,
     }
 
 
@@ -295,6 +339,95 @@ def print_confusion_matrix(
         for m in misclassifications:
             print(m)
     print("=" * 80 + "\n")
+
+
+def format_cross_location_errors(
+    errors: List[Dict[str, Any]],
+    split_name: str = "TEST",
+) -> str:
+    """Format individual cross-location false acceptance errors into a structured report."""
+    lines = [
+        "=" * 80,
+        f"CROSS-LOCATION FALSE ACCEPTANCE DETAILS ({split_name.upper()} SPLIT)",
+        "=" * 80,
+        f"Total Cross-Location Errors: {len(errors)}",
+        "-" * 80,
+    ]
+    if not errors:
+        lines.append(f"No cross-location false acceptances found in {split_name} split.")
+    else:
+        for i, err in enumerate(errors, 1):
+            t_sc = f"{err['target_score']:.4f}" if err.get("target_score") is not None else "N/A"
+            c_sc = f"{err['competing_score']:.4f}" if err.get("competing_score") is not None else "N/A"
+            mg = f"{err['margin']:.4f}" if err.get("margin") is not None else "N/A"
+            lines.extend([
+                f"Error #{i}:",
+                f"  - Relative Image Path:    {err.get('image_path', 'unknown')}",
+                f"  - Actual Location:        {err.get('actual_location', 'unknown')}",
+                f"  - Claimed Location:       {err.get('claimed_location', 'unknown')}",
+                f"  - Best-Matching Location: {err.get('best_matching_location', 'unknown')}",
+                f"  - Target Score:           {t_sc}",
+                f"  - Competing Score:        {c_sc}",
+                f"  - Margin:                 {mg}",
+                f"  - Decision Result:        {err.get('decision', 'unknown')}",
+                "",
+            ])
+    lines.append("=" * 80)
+    return "\n".join(lines)
+
+
+def format_focused_confusion_report(
+    errors: List[Dict[str, Any]],
+    loc_a: str = "4th_floor_near_robotics_lab",
+    loc_b: str = "a_block_near_313",
+) -> str:
+    """Generate a focused report for known confusion between two specific locations."""
+    focused = [
+        e for e in errors
+        if (e.get("actual_location") == loc_a and e.get("claimed_location") == loc_b)
+        or (e.get("actual_location") == loc_b and e.get("claimed_location") == loc_a)
+    ]
+
+    lines = [
+        "=" * 80,
+        f"FOCUSED CONFUSION REPORT: '{loc_a}' <--> '{loc_b}'",
+        "=" * 80,
+        f"Target Location Pair:   '{loc_a}' <--> '{loc_b}'",
+        f"Identified Incidents:   {len(focused)}",
+        "-" * 80,
+    ]
+    if not focused:
+        lines.append(f"No cross-location false acceptances detected between '{loc_a}' and '{loc_b}'.")
+    else:
+        for i, inc in enumerate(focused, 1):
+            t_sc = f"{inc['target_score']:.4f}" if inc.get("target_score") is not None else "N/A"
+            c_sc = f"{inc['competing_score']:.4f}" if inc.get("competing_score") is not None else "N/A"
+            mg = f"{inc['margin']:.4f}" if inc.get("margin") is not None else "N/A"
+            lines.extend([
+                f"Incident #{i}:",
+                f"  - Relative Image Path:    {inc.get('image_path', 'unknown')}",
+                f"  - Actual Location:        {inc.get('actual_location', 'unknown')}",
+                f"  - Claimed Location:       {inc.get('claimed_location', 'unknown')}",
+                f"  - Best-Matching Location: {inc.get('best_matching_location', 'unknown')}",
+                f"  - Target Score:           {t_sc}",
+                f"  - Competing Score:        {c_sc}",
+                f"  - Margin:                 {mg}",
+                f"  - Decision Result:        {inc.get('decision', 'unknown')}",
+                "",
+            ])
+        lines.extend([
+            "Root-Cause & Operational Assessment:",
+            f"  - Physical/Visual Overlap: Captures from '{loc_a}' share visual features with '{loc_b}'",
+            f"    (corridor perspective, recessed doorframes, ceiling fixtures).",
+            f"  - Embedding Proximity: The query image embedding is closer to reference embeddings of '{loc_b}'",
+            f"    than to its true location.",
+            f"  - Safeguards & Thresholds: At current candidate match/margin thresholds,",
+            f"    the score meets or exceeds the acceptance bar, triggering cross-location false acceptance.",
+            f"  - Mitigation: Collect distinct reference views for '{loc_a}' / '{loc_b}' or enforce a higher margin threshold.",
+        ])
+    lines.append("=" * 80)
+    return "\n".join(lines)
+
 
 
 def check_split_data_adequacy(
@@ -354,6 +487,7 @@ def run_calibration(
     device: str = "cpu",
     base_config: Optional[CampusHuntConfig] = None,
     allow_missing_unknown: bool = False,
+    error_report: Optional[Path] = None,
 ) -> bool:
     """Run threshold calibration on calibration data, then evaluate on test data.
 
@@ -742,6 +876,10 @@ def run_calibration(
 
     print_confusion_matrix(best_config["confusion_counts"], store.locations, title="CALIBRATION CONFUSION MATRIX")
 
+    calib_errors = best_config.get("cross_location_false_acceptances", [])
+    if calib_errors:
+        print(format_cross_location_errors(calib_errors, split_name="CALIBRATION"))
+
     # 2. FIX A: Rigorous Hold-Out Test Split Evaluation
     test_dataset = SplitDataset(
         dataset_dir=test_dir,
@@ -845,6 +983,11 @@ def run_calibration(
             print("=" * 80 + "\n")
 
             print_confusion_matrix(test_res["confusion_counts"], store.locations, title="INDEPENDENT TEST CONFUSION MATRIX")
+
+            test_errors = test_res.get("cross_location_false_acceptances", [])
+            if test_errors:
+                print(format_cross_location_errors(test_errors, split_name="TEST"))
+                print(format_focused_confusion_report(test_errors, "4th_floor_near_robotics_lab", "a_block_near_313"))
 
             test_status_val: Literal["completed", "provisional"] = "provisional" if is_test_provisional else "completed"
             test_reason_val: Optional[str] = (
@@ -956,6 +1099,32 @@ def run_calibration(
 
         logger.info("Saved compatible calibrated configuration atomically to '%s'.", output_config)
 
+    if error_report:
+        error_report = Path(error_report)
+        error_report.parent.mkdir(parents=True, exist_ok=True)
+        all_calib_errs = best_config.get("cross_location_false_acceptances", []) if best_config else []
+        all_test_errs = (
+            test_res.get("cross_location_false_acceptances", [])
+            if (has_test_files and is_test_complete)
+            else []
+        )
+        combined_errs = all_calib_errs + all_test_errs
+        report_lines = [
+            "# CAMPUS HUNT CV - CALIBRATION & TEST ERROR REPORT",
+            f"Generated at: {datetime.now(timezone.utc).isoformat()}",
+            f"Model: {store.model_version}",
+            f"Match Threshold: {best_config['match_threshold']:.4f}, Margin Threshold: {best_config['margin_threshold']:.4f}\n",
+            format_cross_location_errors(all_calib_errs, split_name="CALIBRATION"),
+            format_cross_location_errors(all_test_errs, split_name="TEST")
+            if (has_test_files and is_test_complete)
+            else "Test evaluation incomplete/unavailable.\n",
+            format_focused_confusion_report(
+                combined_errs, "4th_floor_near_robotics_lab", "a_block_near_313"
+            ),
+        ]
+        error_report.write_text("\n".join(report_lines), encoding="utf-8")
+        logger.info("Saved detailed error report to '%s'.", error_report)
+
     return True
 
 
@@ -1001,6 +1170,12 @@ def main() -> None:
         type=Path,
         default=Path("calibrated_thresholds.json"),
         help="Path to save recommended calibrated configuration",
+    )
+    parser.add_argument(
+        "--error-report",
+        type=Path,
+        default=None,
+        help="Optional path to save detailed cross-location false acceptance and confusion report",
     )
     parser.add_argument(
         "--diagnostic-report",
@@ -1095,6 +1270,7 @@ def main() -> None:
         device=args.device,
         base_config=cfg,
         allow_missing_unknown=args.allow_missing_unknown,
+        error_report=args.error_report,
     )
 
     if not success:
