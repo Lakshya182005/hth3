@@ -235,6 +235,7 @@ class TestEvaluationMetrics(BaseModel):
 
     status: Literal["completed", "incomplete", "unavailable", "provisional"]
     reason: Optional[str] = None
+    provisional_reasons: Optional[List[str]] = None
     sample_counts: Optional[Dict[str, int]] = None
     missing_categories: Optional[List[str]] = None
     minimums_used: Optional[Dict[str, int]] = None
@@ -250,6 +251,7 @@ class CalibrationMetadata(BaseModel):
     status: Literal["calibrated", "provisional"] = "calibrated"
     is_provisional: bool = False
     warning: Optional[str] = None
+    provisional_reasons: Optional[List[str]] = None
     minimums_used: Optional[Dict[str, int]] = None
     model_version: str
     calibrated_at: str

@@ -227,6 +227,7 @@ def evaluate_thresholds(
 
                 if w_decision == "strong_match":
                     wrong_false_accepts += 1
+                    confusion_counts[actual][wrong_loc] += 1
 
     accept_rate = (correct_accepts / correct_trials) if correct_trials > 0 else 0.0
     far = (wrong_false_accepts / wrong_trials) if wrong_trials > 0 else 0.0
@@ -260,7 +261,7 @@ def print_confusion_matrix(
     locations: List[str],
     title: str = "PER-LOCATION CONFUSION MATRIX",
 ) -> None:
-    """Display formatted per-location confusion matrix."""
+    """Display formatted per-location confusion matrix and identify misclassifications."""
     header_cols = locations + ["rejected/ambiguous"]
     col_width = 16
 
@@ -271,6 +272,7 @@ def print_confusion_matrix(
     print("-" * 80)
 
     all_actuals = sorted(list(confusion_counts.keys()))
+    misclassifications: List[str] = []
     for act in all_actuals:
         row_str = f"{act:<{col_width}} | "
         vals = []
@@ -278,12 +280,20 @@ def print_confusion_matrix(
         for col in locations:
             cnt = confusion_counts[act].get(col, 0)
             vals.append(f"{cnt:>{col_width}}")
+            if col != act and cnt > 0:
+                misclassifications.append(f"  - Actual '{act}' misclassified as competing location '{col}': {cnt} capture(s)")
         for k, cnt in confusion_counts[act].items():
             if k.startswith("unaccepted_"):
                 rejected_count += cnt
         vals.append(f"{rejected_count:>{col_width}}")
         row_str += " | ".join(vals)
         print(row_str)
+
+    if misclassifications:
+        print("-" * 80)
+        print("MISCLASSIFICATIONS DETECTED (Cross-Location False Acceptances):")
+        for m in misclassifications:
+            print(m)
     print("=" * 80 + "\n")
 
 
@@ -390,19 +400,11 @@ def run_calibration(
     model_name = cfg.model.model_name
     pretrained = cfg.model.pretrained
 
-    is_calib_provisional = (
-        effective_min_calib_samples < DEFAULT_MIN_CALIBRATION_SAMPLES_PER_LOCATION
-        or effective_min_calib_unknown < DEFAULT_MIN_CALIBRATION_UNKNOWN_SAMPLES
-    )
-    is_test_provisional = (
-        effective_min_test_samples < DEFAULT_MIN_TEST_SAMPLES_PER_LOCATION
-        or effective_min_test_unknown < DEFAULT_MIN_TEST_UNKNOWN_SAMPLES
-    )
-
     # Check if split manifest marks dataset split as provisional / single-collection or missing unknown
     manifest_paths = [
         calibration_dir.parent / "split_manifest.json",
     ]
+    manifest_independence_unverified = False
     manifest_provisional_reason: Optional[str] = None
     for mp in manifest_paths:
         if mp.exists() and mp.is_file():
@@ -411,8 +413,7 @@ def run_calibration(
                 if manifest_dict.get("allow_missing_unknown", False):
                     allow_missing_unknown = True
                 if manifest_dict.get("provisional", False) or not manifest_dict.get("independence_verifiable", True):
-                    is_calib_provisional = True
-                    is_test_provisional = True
+                    manifest_independence_unverified = True
                     manifest_provisional_reason = manifest_dict.get(
                         "status_reason",
                         "Dataset split originates from a single photo collection session; independence is unverified.",
@@ -421,41 +422,94 @@ def run_calibration(
             except Exception:
                 pass
 
-    if allow_missing_unknown:
-        is_calib_provisional = True
-        is_test_provisional = True
-        if manifest_provisional_reason is None:
-            manifest_provisional_reason = (
-                "Calibrated in provisional mode without unknown/distractor captures (--allow-missing-unknown). "
-                "Evaluated positive matches and inter-checkpoint discrimination only; unknown rejection is unmeasured."
-            )
+    # Track provisional reasons separately:
+    # 1. Sample minimums below project defaults
+    calib_samples_lowered = effective_min_calib_samples < DEFAULT_MIN_CALIBRATION_SAMPLES_PER_LOCATION
+    calib_unknown_lowered = (
+        effective_min_calib_unknown < DEFAULT_MIN_CALIBRATION_UNKNOWN_SAMPLES
+        if not allow_missing_unknown
+        else False
+    )
+    calib_safeguards_lowered = calib_samples_lowered or calib_unknown_lowered
 
+    test_samples_lowered = effective_min_test_samples < DEFAULT_MIN_TEST_SAMPLES_PER_LOCATION
+    test_unknown_lowered = (
+        effective_min_test_unknown < DEFAULT_MIN_TEST_UNKNOWN_SAMPLES
+        if not allow_missing_unknown
+        else False
+    )
+    test_safeguards_lowered = test_samples_lowered or test_unknown_lowered
+
+    # 2. Unknown evaluation unavailable
+    unknown_evaluation_unavailable = bool(allow_missing_unknown)
+
+    # 3. Source capture independence not verified
+    source_independence_unverified = bool(manifest_independence_unverified)
+
+    # Build calibration provisional reasons
+    calib_provisional_reasons: List[str] = []
+    if calib_safeguards_lowered:
+        calib_provisional_reasons.append(
+            f"Sample safeguards were manually set below project standards "
+            f"(requires >= {DEFAULT_MIN_CALIBRATION_SAMPLES_PER_LOCATION} per location, "
+            f">= {DEFAULT_MIN_CALIBRATION_UNKNOWN_SAMPLES} unknown; "
+            f"configured: {effective_min_calib_samples} per location, {effective_min_calib_unknown} unknown)."
+        )
+    if unknown_evaluation_unavailable:
+        calib_provisional_reasons.append(
+            "Unknown/distractor evaluation is unavailable (--allow-missing-unknown); unknown rejection rate cannot be measured."
+        )
+    if source_independence_unverified:
+        calib_provisional_reasons.append(
+            manifest_provisional_reason
+            or "Source capture independence not verified (captures originate from a single collection session)."
+        )
+
+    # Build test provisional reasons
+    test_provisional_reasons: List[str] = []
+    if test_safeguards_lowered:
+        test_provisional_reasons.append(
+            f"Sample safeguards were manually set below project standards "
+            f"(requires >= {DEFAULT_MIN_TEST_SAMPLES_PER_LOCATION} per location, "
+            f">= {DEFAULT_MIN_TEST_UNKNOWN_SAMPLES} unknown; "
+            f"configured: {effective_min_test_samples} per location, {effective_min_test_unknown} unknown)."
+        )
+    if unknown_evaluation_unavailable:
+        test_provisional_reasons.append(
+            "Unknown/distractor evaluation is unavailable (--allow-missing-unknown); unknown rejection rate cannot be measured."
+        )
+    if source_independence_unverified:
+        test_provisional_reasons.append(
+            manifest_provisional_reason
+            or "Source capture independence not verified (captures originate from a single collection session)."
+        )
+
+    is_calib_provisional = len(calib_provisional_reasons) > 0
+    is_test_provisional = len(test_provisional_reasons) > 0
 
     if is_calib_provisional:
+        reasons_bulleted = "\n".join(f"  - {r}" for r in calib_provisional_reasons)
         warning_msg = (
-            f"PROVISIONAL CALIBRATION WARNING: Calibration sample safeguards were manually lowered below "
-            f"recommended project defaults (requires >= {DEFAULT_MIN_CALIBRATION_SAMPLES_PER_LOCATION} per location, "
-            f">= {DEFAULT_MIN_CALIBRATION_UNKNOWN_SAMPLES} unknown; configured: {effective_min_calib_samples} per location, "
-            f"{effective_min_calib_unknown} unknown).\n"
+            f"PROVISIONAL CALIBRATION WARNING: Calibration status is marked as PROVISIONAL due to:\n"
+            f"{reasons_bulleted}\n"
             "Resulting calibration status will be marked as PROVISIONAL rather than implying strong evidence."
         )
         logger.warning(warning_msg)
         print("\n" + "!" * 80)
-        print("WARNING: PROVISIONAL CALIBRATION SAFEGUARDS IN EFFECT")
+        print("WARNING: PROVISIONAL CALIBRATION IN EFFECT")
         print(warning_msg)
         print("!" * 80 + "\n")
 
     if is_test_provisional:
+        reasons_bulleted = "\n".join(f"  - {r}" for r in test_provisional_reasons)
         warning_msg = (
-            f"PROVISIONAL TEST SPLIT WARNING: Test sample safeguards were manually lowered below "
-            f"recommended project defaults (requires >= {DEFAULT_MIN_TEST_SAMPLES_PER_LOCATION} per location, "
-            f">= {DEFAULT_MIN_TEST_UNKNOWN_SAMPLES} unknown; configured: {effective_min_test_samples} per location, "
-            f"{effective_min_test_unknown} unknown).\n"
+            f"PROVISIONAL TEST SPLIT WARNING: Test split evaluation is marked as PROVISIONAL due to:\n"
+            f"{reasons_bulleted}\n"
             "Resulting test evaluation status will be marked as PROVISIONAL rather than completed."
         )
         logger.warning(warning_msg)
         print("\n" + "!" * 80)
-        print("WARNING: PROVISIONAL TEST SPLIT SAFEGUARDS IN EFFECT")
+        print("WARNING: PROVISIONAL TEST SPLIT IN EFFECT")
         print(warning_msg)
         print("!" * 80 + "\n")
 
@@ -528,6 +582,7 @@ def run_calibration(
                 "deployable": False,
                 "calibrated": False,
                 "is_provisional": is_calib_provisional,
+                "provisional_reasons": calib_provisional_reasons if is_calib_provisional else None,
                 "minimums_used": calib_minimums_used,
                 "calibration_sample_counts": dict(calib_dataset.sample_counts),
                 "missing_categories": missing_locs,
@@ -646,6 +701,7 @@ def run_calibration(
                 "deployable": False,
                 "calibrated": False,
                 "is_provisional": is_calib_provisional,
+                "provisional_reasons": calib_provisional_reasons if is_calib_provisional else None,
                 "minimums_used": calib_minimums_used,
                 "model_version": store.model_version,
                 "failed_at": datetime.now(timezone.utc).isoformat(),
@@ -677,7 +733,11 @@ def run_calibration(
     print(f"  Selected Margin Threshold:     {best_config['margin_threshold']:.3f}")
     print(f"  Calibration Acceptance Rate:   {best_config['correct_accept_rate'] * 100:.1f}%")
     print(f"  Calibration Wrong Location FAR:{best_config['wrong_false_accept_rate'] * 100:.2f}%")
-    calib_unk_disp = f"{best_config['unknown_rejection_rate'] * 100:.1f}%" if best_config["unknown_rejection_rate"] is not None else "N/A (Provisional)"
+    calib_unk_disp = (
+        f"{best_config['unknown_rejection_rate'] * 100:.1f}%"
+        if best_config["unknown_rejection_rate"] is not None
+        else "N/A (Unavailable - no unknown captures)"
+    )
     print(f"  Calibration Unknown Rejection: {calib_unk_disp}\n")
 
     print_confusion_matrix(best_config["confusion_counts"], store.locations, title="CALIBRATION CONFUSION MATRIX")
@@ -712,6 +772,7 @@ def run_calibration(
         test_eval_metadata = TestEvaluationMetrics(
             status="unavailable",
             reason=f"No independent test captures found in '{test_dir}'.",
+            provisional_reasons=test_provisional_reasons if is_test_provisional else None,
             sample_counts=dict(test_dataset.sample_counts),
             missing_categories=all_missing,
             minimums_used=test_minimums_used,
@@ -741,6 +802,7 @@ def run_calibration(
             test_eval_metadata = TestEvaluationMetrics(
                 status="incomplete",
                 reason=f"Test split is incomplete. Missing required categories or counts: {', '.join(missing_test)}",
+                provisional_reasons=test_provisional_reasons if is_test_provisional else None,
                 sample_counts=dict(test_dataset.sample_counts),
                 missing_categories=missing_test,
                 minimums_used=test_minimums_used,
@@ -759,32 +821,34 @@ def run_calibration(
                 mismatch_threshold=None,
             )
 
-            test_title = (
-                "PROVISIONAL TEST SET EVALUATION (Hold-out evaluation with lowered safeguards)"
-                if is_test_provisional
-                else "INDEPENDENT TEST SET EVALUATION (Unbiased hold-out generalization)"
-            )
+            if test_safeguards_lowered:
+                test_title = "PROVISIONAL TEST SET EVALUATION (Hold-out evaluation with lowered safeguards)"
+            elif is_test_provisional:
+                test_title = "PROVISIONAL TEST SET EVALUATION (Hold-out evaluation - provisional)"
+            else:
+                test_title = "INDEPENDENT TEST SET EVALUATION (Unbiased hold-out generalization)"
             print("\n" + "=" * 80)
             print(test_title)
             print("=" * 80)
             test_unk_disp = (
                 f"{test_res['unknown_rejection_rate'] * 100:.1f}%"
                 if test_res["unknown_rejection_rate"] is not None
-                else "N/A (Provisional)"
+                else "N/A (Unavailable - no unknown captures)"
             )
             print(f"  Test Correct Acceptance Rate:  {test_res['correct_accept_rate'] * 100:.1f}%")
             print(f"  Test Wrong Location FAR:       {test_res['wrong_false_accept_rate'] * 100:.2f}%")
             print(f"  Test Unknown Rejection Rate:   {test_unk_disp}")
             if is_test_provisional:
-                print("  NOTICE: Safeguards lowered below standard; results are provisional and do not establish verified generalization.")
+                print("  NOTICE: Results are provisional and do not establish verified generalization due to:")
+                for r in test_provisional_reasons:
+                    print(f"    - {r}")
             print("=" * 80 + "\n")
 
             print_confusion_matrix(test_res["confusion_counts"], store.locations, title="INDEPENDENT TEST CONFUSION MATRIX")
 
             test_status_val: Literal["completed", "provisional"] = "provisional" if is_test_provisional else "completed"
             test_reason_val: Optional[str] = (
-                manifest_provisional_reason
-                or "Evaluated with manually lowered sample safeguards. Results are provisional and do not guarantee generalization."
+                "; ".join(test_provisional_reasons)
                 if is_test_provisional
                 else None
             )
@@ -792,6 +856,7 @@ def run_calibration(
             test_eval_metadata = TestEvaluationMetrics(
                 status=test_status_val,
                 reason=test_reason_val,
+                provisional_reasons=test_provisional_reasons if is_test_provisional else None,
                 sample_counts=dict(test_dataset.sample_counts),
                 missing_categories=None,
                 minimums_used=test_minimums_used,
@@ -820,13 +885,7 @@ def run_calibration(
 
         calib_status_val: Literal["calibrated", "provisional"] = "provisional" if is_calib_provisional else "calibrated"
         calib_warning_val: Optional[str] = (
-            manifest_provisional_reason
-            or (
-                f"Sample safeguards were manually set below project standards "
-                f"({DEFAULT_MIN_CALIBRATION_SAMPLES_PER_LOCATION} per location, "
-                f"{DEFAULT_MIN_CALIBRATION_UNKNOWN_SAMPLES} unknown). "
-                "Thresholds are provisional and require further real campus data collection."
-            )
+            "; ".join(calib_provisional_reasons)
             if is_calib_provisional
             else None
         )
@@ -866,6 +925,7 @@ def run_calibration(
                 status=calib_status_val,
                 is_provisional=is_calib_provisional,
                 warning=calib_warning_val,
+                provisional_reasons=calib_provisional_reasons if is_calib_provisional else None,
                 model_version=store.model_version,
                 calibrated_at=datetime.now(timezone.utc).isoformat(),
                 minimums_used=calib_minimums_used,

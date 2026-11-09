@@ -36,7 +36,7 @@ from campus_hunt_cv.decision import DecisionEngine
 from campus_hunt_cv.embeddings_store import ReferenceEmbeddingsStore
 from campus_hunt_cv.exceptions import ConfigurationError, ReferenceDataError
 from campus_hunt_cv.similarity import SimilarityScorer
-from campus_hunt_cv.verifier import LocationVerifier
+from campus_hunt_cv.verifier import LocationVerifier, check_config_validation_status
 from tests.conftest import MockEmbedder, create_test_image_bytes
 
 
@@ -1034,6 +1034,158 @@ def test_manually_lowering_minimum_produces_warning_and_provisional_status(tmp_p
         "min_test_unknown_samples": 1,
     }
     assert loaded.calibration_metadata.test_evaluation.metrics is not None
+
+
+def test_provisional_warning_exact_defaults_missing_unknown(tmp_path: Path, monkeypatch, caplog):
+    """Exact default minimums (5 and 10) with --allow-missing-unknown marks provisional without claiming lowered safeguards."""
+    calib_dir = tmp_path / "calib"
+    test_dir = tmp_path / "test"
+    out_cfg = tmp_path / "provisional_defaults_out.json"
+    npz_path = tmp_path / "emb.npz"
+    meta_path = tmp_path / "meta.json"
+
+    dim = 64
+    ReferenceEmbeddingsStore.save(
+        npz_path=npz_path,
+        metadata_path=meta_path,
+        embeddings_by_location={"loc_a": np.ones((1, dim), dtype=np.float32)},
+        model_name="ViT-B-32",
+        pretrained="mock_test",
+    )
+    # Populate exact default 5 images per location, NO unknown folder
+    populate_split(calib_dir, {"loc_a": 5})
+    populate_split(test_dir, {"loc_a": 5})
+
+    mock_emb = MockEmbedder(dimension=dim)
+    monkeypatch.setattr("campus_hunt_cv.cli.calibrate.OpenCLIPLocationEmbedder", lambda config: mock_emb)
+
+    base_cfg = CampusHuntConfig(
+        model=ModelConfig(model_name="ViT-B-32", pretrained="mock_test", device="cpu"),
+    )
+
+    with caplog.at_level("WARNING"):
+        success = run_calibration(
+            calibration_dir=calib_dir,
+            test_dir=test_dir,
+            embeddings_npz=npz_path,
+            metadata_json=meta_path,
+            output_config=out_cfg,
+            max_far=1.0,
+            min_unknown_rejection=0.0,
+            allow_missing_unknown=True,
+            # No manually lowered minimums passed: defaults 5 and 10 remain effective
+            base_config=base_cfg,
+        )
+
+    assert success is True
+    # Verify provisional warning was logged
+    assert any("PROVISIONAL CALIBRATION WARNING" in record.message for record in caplog.records)
+    # But safeguards lowered warning must NOT be logged
+    assert not any("safeguards were manually lowered" in record.message for record in caplog.records)
+    assert not any("below project standards" in record.message for record in caplog.records)
+
+    loaded = CampusHuntConfig.from_json_file(out_cfg)
+
+    # Status is provisional
+    assert loaded.calibration_metadata.status == "provisional"
+    assert loaded.calibration_metadata.is_provisional is True
+    assert loaded.calibration_metadata.warning is not None
+    # Must NOT say below project standards or safeguards lowered
+    assert "below project standards" not in loaded.calibration_metadata.warning
+    assert "safeguards were manually lowered" not in loaded.calibration_metadata.warning
+
+    # Must specify unavailable unknown evaluation in provisional reasons
+    assert loaded.calibration_metadata.provisional_reasons is not None
+    assert any("Unknown/distractor evaluation is unavailable" in r for r in loaded.calibration_metadata.provisional_reasons)
+    assert not any("Sample safeguards were manually set below project standards" in r for r in loaded.calibration_metadata.provisional_reasons)
+
+    # Test evaluation is provisional with clear reason
+    assert loaded.calibration_metadata.test_evaluation.status == "provisional"
+    assert loaded.calibration_metadata.test_evaluation.is_provisional is True
+    assert loaded.calibration_metadata.test_evaluation.provisional_reasons is not None
+    assert any("Unknown/distractor evaluation is unavailable" in r for r in loaded.calibration_metadata.test_evaluation.provisional_reasons)
+    assert not any("Sample safeguards were manually set below project standards" in r for r in loaded.calibration_metadata.test_evaluation.provisional_reasons)
+
+    # Unknown metrics are null
+    assert loaded.calibration_metadata.calibration_metrics.unknown_rejection_rate is None
+    assert loaded.calibration_metadata.test_evaluation.metrics.unknown_rejection_rate is None
+
+    # Gate still fails safe to ambiguous in production
+    can_auto_accept, reason = check_config_validation_status(loaded)
+    assert can_auto_accept is False
+    assert reason == "PROVISIONAL_CALIBRATION_REQUIRES_REVIEW"
+
+
+def test_provisional_warning_genuinely_lowered_counts(tmp_path: Path, monkeypatch, caplog):
+    """Genuinely lowered minimums report lowered sample safeguards, cite project defaults, and record provisional reasons."""
+    calib_dir = tmp_path / "calib"
+    test_dir = tmp_path / "test"
+    out_cfg = tmp_path / "provisional_lowered_out.json"
+    npz_path = tmp_path / "emb.npz"
+    meta_path = tmp_path / "meta.json"
+
+    dim = 64
+    ReferenceEmbeddingsStore.save(
+        npz_path=npz_path,
+        metadata_path=meta_path,
+        embeddings_by_location={"loc_a": np.ones((1, dim), dtype=np.float32)},
+        model_name="ViT-B-32",
+        pretrained="mock_test",
+    )
+    # Populate lowered counts: 2 for loc_a, 3 for unknown
+    populate_split(calib_dir, {"loc_a": 2, "unknown": 3})
+    populate_split(test_dir, {"loc_a": 2, "unknown": 3})
+
+    mock_emb = MockEmbedder(dimension=dim)
+    monkeypatch.setattr("campus_hunt_cv.cli.calibrate.OpenCLIPLocationEmbedder", lambda config: mock_emb)
+
+    base_cfg = CampusHuntConfig(
+        model=ModelConfig(model_name="ViT-B-32", pretrained="mock_test", device="cpu"),
+    )
+
+    with caplog.at_level("WARNING"):
+        success = run_calibration(
+            calibration_dir=calib_dir,
+            test_dir=test_dir,
+            embeddings_npz=npz_path,
+            metadata_json=meta_path,
+            output_config=out_cfg,
+            max_far=1.0,
+            min_unknown_rejection=0.0,
+            min_calib_samples_per_location=2,
+            min_calib_unknown_samples=3,
+            min_test_samples_per_location=2,
+            min_test_unknown_samples=3,
+            allow_missing_unknown=False,
+            base_config=base_cfg,
+        )
+
+    assert success is True
+    # Verify lowered safeguards warning was logged
+    assert any("PROVISIONAL CALIBRATION WARNING" in record.message for record in caplog.records)
+    assert any("below project standards" in record.message for record in caplog.records)
+
+    loaded = CampusHuntConfig.from_json_file(out_cfg)
+
+    # Status is provisional
+    assert loaded.calibration_metadata.status == "provisional"
+    assert loaded.calibration_metadata.is_provisional is True
+    assert loaded.calibration_metadata.warning is not None
+    assert "below project standards" in loaded.calibration_metadata.warning
+
+    # Provisional reasons record lowered safeguards explicitly
+    assert loaded.calibration_metadata.provisional_reasons is not None
+    assert any("Sample safeguards were manually set below project standards" in r for r in loaded.calibration_metadata.provisional_reasons)
+    assert not any("Unknown/distractor evaluation is unavailable" in r for r in loaded.calibration_metadata.provisional_reasons)
+
+    assert loaded.calibration_metadata.test_evaluation.status == "provisional"
+    assert loaded.calibration_metadata.test_evaluation.provisional_reasons is not None
+    assert any("Sample safeguards were manually set below project standards" in r for r in loaded.calibration_metadata.test_evaluation.provisional_reasons)
+    assert not any("Unknown/distractor evaluation is unavailable" in r for r in loaded.calibration_metadata.test_evaluation.provisional_reasons)
+
+    # Unknown metrics ARE present because unknown was evaluated
+    assert loaded.calibration_metadata.calibration_metrics.unknown_rejection_rate is not None
+    assert loaded.calibration_metadata.test_evaluation.metrics.unknown_rejection_rate is not None
 
 
 def test_inadequate_calibration_does_not_create_or_overwrite_active_config(tmp_path: Path, monkeypatch):

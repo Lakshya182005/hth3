@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from campus_hunt_cv.cli.build_embeddings import build_reference_embeddings
-from campus_hunt_cv.cli.calibrate import evaluate_thresholds
+from campus_hunt_cv.cli.calibrate import evaluate_thresholds, print_confusion_matrix
 from campus_hunt_cv.config import ScoringConfig
 from campus_hunt_cv.similarity import SimilarityScorer
 
@@ -136,5 +136,43 @@ def test_evaluate_thresholds_no_unknown_samples_sets_null_metrics(mock_reference
     assert metrics["unknown_trials"] is None
     assert metrics["unknown_rejections"] is None
     assert metrics["unknown_rejection_rate"] is None
+
+
+def test_evaluate_thresholds_and_confusion_matrix_identifies_misclassifications(mock_reference_store, capsys):
+    """When a capture is misclassified as a competing location, it is identified in confusion matrix output."""
+    scorer = SimilarityScorer()
+    scoring_config = ScoringConfig(min_reference_images_per_location=1)
+
+    # c1 is actually clock_tower, but has score 0.85 for library_atrium and 0.40 for clock_tower
+    samples = [
+        {
+            "actual": "clock_tower",
+            "file": "c1.jpg",
+            "scores": {"clock_tower": 0.40, "library_atrium": 0.85, "science_quad": 0.20},
+        },
+    ]
+
+    metrics = evaluate_thresholds(
+        samples=samples,
+        store=mock_reference_store,
+        scorer=scorer,
+        base_scoring_config=scoring_config,
+        match_threshold=0.60,
+        margin_threshold=0.08,
+    )
+
+    # Cross-location false acceptance occurred
+    assert metrics["wrong_false_accepts"] == 1
+    assert metrics["confusion_counts"]["clock_tower"]["library_atrium"] == 1
+
+    print_confusion_matrix(
+        confusion_counts=metrics["confusion_counts"],
+        locations=["clock_tower", "library_atrium", "science_quad"],
+    )
+
+    captured = capsys.readouterr().out
+    assert "MISCLASSIFICATIONS DETECTED (Cross-Location False Acceptances):" in captured
+    assert "Actual 'clock_tower' misclassified as competing location 'library_atrium': 1 capture(s)" in captured
+
 
 
