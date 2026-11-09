@@ -39,3 +39,11 @@ class ConfigurationError(CampusHuntError):
     def __init__(self, message: str, reason_code: str = "ERROR_CONFIGURATION"):
         super().__init__(message, reason_code=reason_code)
 
+
+class DataSplitError(CampusHuntError):
+    """Raised when data splitting fails due to inadequate samples, collisions, or missing directories."""
+
+    def __init__(self, message: str, reason_code: str = "ERROR_DATA_SPLIT"):
+        super().__init__(message, reason_code=reason_code)
+
+

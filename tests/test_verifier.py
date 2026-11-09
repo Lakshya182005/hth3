@@ -39,11 +39,14 @@ def test_verification_contract_schema(mock_reference_store: ReferenceEmbeddingsS
     assert isinstance(result["model_version"], str)
 
 
-def test_missing_reference_data_returns_ambiguous():
+def test_missing_reference_data_returns_ambiguous(tmp_path):
     """If no reference embeddings exist, return ambiguous with clear error code."""
     embedder = MockEmbedder(dimension=64)
+    config = CampusHuntConfig()
+    config.storage.embeddings_path = tmp_path / "nonexistent.npz"
+    config.storage.metadata_path = tmp_path / "nonexistent.meta.json"
     verifier = LocationVerifier(
-        config=CampusHuntConfig(),
+        config=config,
         embedder=embedder,
         store=None,  # No store loaded
     )

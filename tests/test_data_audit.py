@@ -411,3 +411,73 @@ def test_audit_cli_config_file_integration(tmp_path: Path):
     assert report_data["configuration"]["min_calibration_samples_per_location"] == 6
     assert "accuracy" not in report_data
 
+
+def test_audit_allow_missing_unknown_provisional_pass(tmp_path: Path):
+    """Audit without unknown folders fails by default, but passes as provisional when allow_missing_unknown is True."""
+    locations = ["gym", "library"]
+    ref_dir, calib_dir, test_dir = create_split_dataset(
+        base_dir=tmp_path,
+        locations=locations,
+        ref_counts={"gym": 3, "library": 3},
+        calib_counts={"gym": 5, "library": 5},
+        test_counts={"gym": 5, "library": 5},
+        calib_unknown_count=0,
+        test_unknown_count=0,
+    )
+
+    # 1. Default strict audit fails closed
+    strict_report = audit_dataset(
+        reference_dir=ref_dir,
+        calibration_dir=calib_dir,
+        test_dir=test_dir,
+        allow_missing_unknown=False,
+    )
+    assert strict_report.audit_passed is False
+    assert any("Calibration split is missing required 'unknown/' distractor folder" in i for i in strict_report.issues)
+    assert any("Test split is missing required 'unknown/' distractor folder" in i for i in strict_report.issues)
+
+    # 2. Provisional mode passes
+    prov_report = audit_dataset(
+        reference_dir=ref_dir,
+        calibration_dir=calib_dir,
+        test_dir=test_dir,
+        allow_missing_unknown=True,
+    )
+    assert prov_report.audit_passed is True
+    assert prov_report.provisional_no_unknown is True
+    assert prov_report.allow_missing_unknown is True
+    assert prov_report.issues == []
+    summary_text = prov_report.format_text_summary()
+    assert "STRUCTURALLY SPLIT (UNKNOWN EVALUATION UNAVAILABLE - PROVISIONAL)" in summary_text
+
+
+def test_audit_cli_allow_missing_unknown_integration(tmp_path: Path):
+    """CLI --allow-missing-unknown flag produces passing provisional report with exit code 0."""
+    locations = ["courtyard"]
+    ref_dir, calib_dir, test_dir = create_split_dataset(
+        base_dir=tmp_path,
+        locations=locations,
+        ref_counts={"courtyard": 2},
+        calib_counts={"courtyard": 5},
+        test_counts={"courtyard": 5},
+        calib_unknown_count=0,
+        test_unknown_count=0,
+    )
+
+    report_file = tmp_path / "prov_audit_report.json"
+    exit_code = audit_cli_main([
+        "--reference-dir", str(ref_dir),
+        "--calibration-dir", str(calib_dir),
+        "--test-dir", str(test_dir),
+        "--allow-missing-unknown",
+        "--output-report", str(report_file),
+    ])
+
+    assert exit_code == 0
+    assert report_file.exists()
+    data = json.loads(report_file.read_text(encoding="utf-8"))
+    assert data["audit_passed"] is True
+    assert data["provisional_no_unknown"] is True
+    assert data["allow_missing_unknown"] is True
+
+

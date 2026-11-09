@@ -39,6 +39,22 @@ data/*.npz
 data/*.meta.json
 calibrated_thresholds.json
 
+# Campus image files
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.JPG
+*.JPEG
+*.PNG
+*.WEBP
+
+# Backups and split artifacts
+data/backup/
+data/backup_*/
+data/split_manifest.json
+data/*.csv
+
 # OS files
 .DS_Store
 

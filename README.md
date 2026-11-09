@@ -41,6 +41,11 @@ data/
       parking_lot.jpg
 ```
 
+### Location ID Stabilization & Mapping
+Location subdirectories in `data/reference/` use stable, canonical identifiers (e.g. `2nd_floor_clock`, `a_block_entry_gate`, `ashok_goel_library`).
+The complete old-folder to stable-ID mapping is recorded in `data/location_id_map.csv` (`location_id,display_name`).
+**Calibration (`data/calibration/`) and test (`data/test/`) splits must strictly use these exact stable IDs** as folder names so categories align across splits.
+
 ### Data Collection & Leakage Prevention Rules:
 1. **Three-Way Independent Split**:
    - `data/reference/`: Used exclusively to build precomputed embeddings for all hunt locations.
@@ -70,7 +75,49 @@ campus-hunt-audit-data \
   --min-test-samples 5 \
   --min-test-unknown 10 \
   --output-report reports/dataset_audit.json
+
+# Audit in provisional mode when all locations are checkpoints (no unknown/ distractor folders)
+campus-hunt-audit-data --allow-missing-unknown
 ```
+
+### Dataset Auto-Splitter (`campus-hunt-split-data`)
+
+To partition raw campus photo folders into independent `reference`, `calibration`, and `test` splits without manually sorting images:
+
+```bash
+# 1. DRY RUN (Default): Inspect proposed assignments without changing any files
+campus-hunt-split-data \
+  --source-dir data/reference \
+  --unknown-location-ids nesla new_pushpa_ground_floor
+
+# 2. EXPLICIT APPLY: Preserves originals in backup, then builds the three splits
+campus-hunt-split-data \
+  --source-dir data/reference \
+  --unknown-location-ids nesla new_pushpa_ground_floor \
+  --reference-dir data/reference \
+  --calibration-dir data/calibration \
+  --test-dir data/test \
+  --backup-dir data/backup/reference_original \
+  --manifest-path data/split_manifest.json \
+  --apply
+
+# 3. PROVISIONAL NO-UNKNOWN MODE (--allow-missing-unknown):
+# Retains ALL campus locations as active checkpoints without designating any location as unknown
+campus-hunt-split-data \
+  --source-dir data/reference \
+  --allow-missing-unknown
+```
+
+#### What `campus-hunt-split-data` Enforces:
+1. **Dry-Run by Default**: Unless `--apply` is passed, no files are created, moved, or deleted.
+2. **Safeguard Quotas**: For each active hunt location, it assigns 5 images to calibration, 5 different images to hold-out test, and preserves all remaining images in reference. Locations with insufficient images fail closed.
+3. **Explicit Non-Checkpoint Exclusion**: Locations passed to `--unknown-location-ids` are excluded from active hunt reference sets and their images are distributed across `calibration/unknown` and `test/unknown` (requires at least 10 in each split).
+4. **No Guessed Unknowns**: If `--unknown-location-ids` is omitted, the tool does not fabricate unknown images. It warns that calibration requires real non-checkpoint imagery.
+5. **Provisional No-Unknown Mode (`--allow-missing-unknown`)**: When all campus folders are active hunt checkpoints and no non-checkpoint distractors exist, this mode splits each location into 5 calibration, 5 test, and remaining reference images without creating `unknown/` folders. It explicitly marks the split and manifest as `provisional: True`, with `unknown_evaluation: "unavailable"`.
+6. **Near-Duplicate / Burst Clustering**: Images captured within rapid-fire bursts (e.g. $\le 3$ seconds apart) are clustered together to prevent burst leakage across opposing splits.
+7. **Zero SHA-256 Duplicates**: Mathematically verifies that no exact duplicate image appears across `reference`, `calibration`, and `test`.
+8. **Pristine Backup**: On `--apply`, the entire source directory is preserved in `data/backup/` before target directories are created.
+9. **Provisional Marking**: Splits derived from a single photo collection session are marked `provisional: True` in `data/split_manifest.json`. Downstream calibration inherits this provisional status so it cannot authorize automatic production verification without truly independent multi-session data.
 
 #### What `campus-hunt-audit-data` Checks:
 1. **Reference Split Completeness**: Every reference location folder contains valid image files and meets the configured reference-photo minimum (default: 1).
@@ -173,6 +220,15 @@ campus-hunt-calibrate \
   --min-test-samples 5 \
   --min-test-unknown 10 \
   --device cpu
+
+# Calibrate in provisional mode without unknown distractors (--allow-missing-unknown)
+campus-hunt-calibrate \
+  --calibration-dir data/calibration \
+  --test-dir data/test \
+  --embeddings-npz data/reference_embeddings.npz \
+  --metadata-json data/reference_embeddings.meta.json \
+  --output-config calibrated_thresholds.json \
+  --allow-missing-unknown
 ```
 
 ### Process Details & Safety Guarantees:
@@ -182,6 +238,12 @@ campus-hunt-calibrate \
    - **Sample-Count Safeguards**: Requires at least **5 independent captures per hunt location** and at least **10 unknown/distractor captures** by default (`--min-calib-samples 5`, `--min-calib-unknown 10`). A single photo per category cannot qualify as an adequate split.
    - **Data Safeguard Note**: Minimum capture thresholds are practical data-quality safeguards to prevent degenerate or unrepresentative calibration—they do **not** constitute statistical proof of model reliability on campus. The team must still collect varied captures (across different phones, camera angles, lighting conditions, and times of day) and review confusion matrices.
    - **Provisional Status on Lowered Minimums**: If a user manually overrides minimums below project standards (< 5 per location or < 10 unknown), the CLI emits a prominent warning and marks calibration status as `"provisional"` (`is_provisional=True`) in the metadata rather than implying verified evidence.
+   - **Provisional No-Unknown Calibration (`--allow-missing-unknown`)**:
+     - When distractor captures do not exist and all locations are active checkpoints, this flag allows calibration and hold-out evaluation to proceed without `unknown/` folders (also auto-detected from `data/split_manifest.json`).
+     - Evaluates what the data supports: positive match accuracy and inter-checkpoint competing false accept rate (FAR).
+     - Because unknown/distractor photos are absent, unknown rejection cannot be measured. `unknown_rejection_rate`, `unknown_trials`, and `unknown_rejections` are recorded as `null` in config metadata.
+     - Automatically marks calibration metadata as `status: "provisional"` and `is_provisional: true`.
+     - In production runtime environments, the verification safety gate strictly blocks auto-acceptance (`strong_match`), forcing verdicts to `ambiguous` with `PROVISIONAL_CALIBRATION_REQUIRES_REVIEW` so manual review is preserved.
 2. **Fail-Closed Calibration (No Satisfying Threshold or Inadequate Data)**:
    - If calibration data is inadequate (missing locations or counts below safeguard), calibration halts immediately with an error and **does not** create or overwrite any configuration.
    - If no candidate threshold pair meets all configured safety constraints (e.g. `FAR <= max_far` and `unknown_rejection >= min_unknown_rejection`), calibration **fails closed**:
@@ -192,7 +254,7 @@ campus-hunt-calibrate \
      - An optional diagnostic report can be saved via `--diagnostic-report`, marked as `deployable: false, calibrated: false`.
 3. **Hold-Out Test Split Outcomes (`data/test/`)**:
    - Requires at least **5 independent captures per hunt location** and at least **10 unknown/distractor captures** (`--min-test-samples 5`, `--min-test-unknown 10`) for a completed evaluation.
-   - `unavailable`: No usable test captures in `data/test/`. Metrics are `null`, and missing categories are recorded.
+   - `unavailable`: No usable test captures in `data/test/`, or hold-out unknown evaluation is unavailable (e.g. in provisional mode without distractors). Metrics are `null`, and missing categories or reasons are recorded.
    - `incomplete`: Test captures exist, but some reference locations or `unknown/` are missing, or counts fall below minimums. Partial metrics are **not** presented as complete independent test performance (metrics are `null`), and missing categories are recorded with a clear message.
    - `completed`: All required categories and sample counts meet or exceed the standard minimums (>= 5 per location, >= 10 unknown). Selected thresholds are evaluated once to measure unbiased generalization performance.
    - `provisional`: If test minimums were manually lowered below project standards (< 5 or < 10) and met, test evaluation runs but is recorded as `"provisional"` with `is_provisional=True`, warning that the sample size does not guarantee generalization.

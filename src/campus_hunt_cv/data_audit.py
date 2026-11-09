@@ -101,12 +101,23 @@ class DatasetAuditReport:
     splits: Dict[str, SplitAuditResult]
     duplicates: Dict[str, List[DuplicateGroup]]
     issues: List[str]
+    allow_missing_unknown: bool = False
+    provisional_no_unknown: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert audit report to a serializable dictionary."""
         return {
             "timestamp": self.timestamp,
             "audit_passed": self.audit_passed,
+            "allow_missing_unknown": self.allow_missing_unknown,
+            "provisional_no_unknown": self.provisional_no_unknown,
+            "status": (
+                "STRUCTURALLY_SPLIT_UNKNOWN_UNAVAILABLE"
+                if self.provisional_no_unknown
+                else ("PASSED" if self.audit_passed else "FAILED")
+            ),
+            "fully_validated": False if self.provisional_no_unknown else self.audit_passed,
+            "unknown_evaluation": "unavailable" if self.provisional_no_unknown else "available",
             "summary": self.summary,
             "configuration": self.configuration,
             "splits": {name: asdict(split) for name, split in self.splits.items()},
@@ -135,8 +146,16 @@ class DatasetAuditReport:
         lines.append("CAMPUS HUNT DATASET INTEGRITY AUDIT")
         lines.append(divider)
         lines.append(f"Audit Timestamp: {self.timestamp}")
-        status_text = "PASSED" if self.audit_passed else "FAILED"
+        if self.provisional_no_unknown:
+            status_text = "STRUCTURALLY SPLIT (UNKNOWN EVALUATION UNAVAILABLE - PROVISIONAL)"
+        else:
+            status_text = "PASSED" if self.audit_passed else "FAILED"
         lines.append(f"Overall Status:  {status_text}")
+        if self.provisional_no_unknown:
+            lines.append("Notice:          Dataset is structurally partitioned across all checkpoint locations,")
+            lines.append("                 but unknown/ distractor folders are absent. False Acceptance Rate (FAR)")
+            lines.append("                 and unknown rejection cannot be evaluated. This split is NOT fully")
+            lines.append("                 validated and must remain provisional.")
         lines.append(f"Total Issues:    {len(self.issues)}")
         lines.append(subdivider)
 
@@ -210,6 +229,7 @@ def audit_dataset(
     min_test_samples_per_location: Optional[int] = None,
     min_test_unknown_samples: Optional[int] = None,
     image_limits: Optional[ImageLimitsConfig] = None,
+    allow_missing_unknown: bool = False,
 ) -> DatasetAuditReport:
     """Execute offline data audit across reference, calibration, and test splits.
 
@@ -451,10 +471,11 @@ def audit_dataset(
 
         # Check required unknown/ folder
         if "unknown" not in observed_subdirs:
-            split_res.missing_locations.append("unknown")
-            issues.append(
-                f"{split_name.capitalize()} split is missing required 'unknown/' distractor folder."
-            )
+            if not allow_missing_unknown:
+                split_res.missing_locations.append("unknown")
+                issues.append(
+                    f"{split_name.capitalize()} split is missing required 'unknown/' distractor folder."
+                )
 
         # Check unexpected subdirectories (not in reference and not 'unknown')
         for sdir in sorted(observed_subdirs):
@@ -637,11 +658,24 @@ def audit_dataset(
         "min_test_samples_per_location": eff_min_tst_loc,
         "min_test_unknown_samples": eff_min_tst_unk,
         "image_limits": limits.model_dump(),
+        "allow_missing_unknown": allow_missing_unknown,
     }
+
+    cal_split = splits_data.get("calibration")
+    tst_split = splits_data.get("test")
+    has_unknown = (
+        cal_split is not None
+        and "unknown" in cal_split.locations
+        and tst_split is not None
+        and "unknown" in tst_split.locations
+    )
+    provisional_no_unknown = allow_missing_unknown and (not has_unknown)
 
     return DatasetAuditReport(
         timestamp=datetime.now(timezone.utc).isoformat(),
         audit_passed=audit_passed,
+        allow_missing_unknown=allow_missing_unknown,
+        provisional_no_unknown=provisional_no_unknown,
         summary=summary,
         configuration=configuration,
         splits=splits_data,

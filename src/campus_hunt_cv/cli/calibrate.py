@@ -230,7 +230,14 @@ def evaluate_thresholds(
 
     accept_rate = (correct_accepts / correct_trials) if correct_trials > 0 else 0.0
     far = (wrong_false_accepts / wrong_trials) if wrong_trials > 0 else 0.0
-    unk_rej_rate = (unknown_rejections / unknown_trials) if unknown_trials > 0 else 1.0
+    if unknown_trials > 0:
+        unk_rej_rate: Optional[float] = unknown_rejections / unknown_trials
+        unk_trials_val: Optional[int] = unknown_trials
+        unk_rejections_val: Optional[int] = unknown_rejections
+    else:
+        unk_rej_rate = None
+        unk_trials_val = None
+        unk_rejections_val = None
 
     return {
         "match_threshold": match_threshold,
@@ -242,8 +249,8 @@ def evaluate_thresholds(
         "correct_accepts": correct_accepts,
         "wrong_trials": wrong_trials,
         "wrong_false_accepts": wrong_false_accepts,
-        "unknown_trials": unknown_trials,
-        "unknown_rejections": unknown_rejections,
+        "unknown_trials": unk_trials_val,
+        "unknown_rejections": unk_rejections_val,
         "confusion_counts": confusion_counts,
     }
 
@@ -285,6 +292,7 @@ def check_split_data_adequacy(
     sample_counts: Dict[str, int],
     min_samples_per_location: int = DEFAULT_MIN_CALIBRATION_SAMPLES_PER_LOCATION,
     min_unknown_samples: int = DEFAULT_MIN_CALIBRATION_UNKNOWN_SAMPLES,
+    allow_missing_unknown: bool = False,
 ) -> Tuple[bool, List[str]]:
     """Verify that split data contains sufficient samples across all hunt locations and unknown."""
     missing: List[str] = []
@@ -293,9 +301,10 @@ def check_split_data_adequacy(
         if count < min_samples_per_location:
             missing.append(f"{loc} (count={count} < {min_samples_per_location})")
 
-    unknown_count = sample_counts.get("unknown", 0)
-    if unknown_count < min_unknown_samples:
-        missing.append(f"unknown (count={unknown_count} < {min_unknown_samples})")
+    if not allow_missing_unknown:
+        unknown_count = sample_counts.get("unknown", 0)
+        if unknown_count < min_unknown_samples:
+            missing.append(f"unknown (count={unknown_count} < {min_unknown_samples})")
 
     return (len(missing) == 0, missing)
 
@@ -305,6 +314,7 @@ def check_calibration_data_adequacy(
     sample_counts: Dict[str, int],
     min_samples_per_location: int = DEFAULT_MIN_CALIBRATION_SAMPLES_PER_LOCATION,
     min_unknown_samples: int = DEFAULT_MIN_CALIBRATION_UNKNOWN_SAMPLES,
+    allow_missing_unknown: bool = False,
 ) -> Tuple[bool, List[str]]:
     """Backward-compatible wrapper for calibration adequacy check."""
     return check_split_data_adequacy(
@@ -312,6 +322,7 @@ def check_calibration_data_adequacy(
         sample_counts=sample_counts,
         min_samples_per_location=min_samples_per_location,
         min_unknown_samples=min_unknown_samples,
+        allow_missing_unknown=allow_missing_unknown,
     )
 
 
@@ -332,6 +343,7 @@ def run_calibration(
     min_test_unknown_samples: Optional[int] = None,
     device: str = "cpu",
     base_config: Optional[CampusHuntConfig] = None,
+    allow_missing_unknown: bool = False,
 ) -> bool:
     """Run threshold calibration on calibration data, then evaluate on test data.
 
@@ -386,6 +398,38 @@ def run_calibration(
         effective_min_test_samples < DEFAULT_MIN_TEST_SAMPLES_PER_LOCATION
         or effective_min_test_unknown < DEFAULT_MIN_TEST_UNKNOWN_SAMPLES
     )
+
+    # Check if split manifest marks dataset split as provisional / single-collection or missing unknown
+    manifest_paths = [
+        calibration_dir.parent / "split_manifest.json",
+    ]
+    manifest_provisional_reason: Optional[str] = None
+    for mp in manifest_paths:
+        if mp.exists() and mp.is_file():
+            try:
+                manifest_dict = json.loads(mp.read_text(encoding="utf-8"))
+                if manifest_dict.get("allow_missing_unknown", False):
+                    allow_missing_unknown = True
+                if manifest_dict.get("provisional", False) or not manifest_dict.get("independence_verifiable", True):
+                    is_calib_provisional = True
+                    is_test_provisional = True
+                    manifest_provisional_reason = manifest_dict.get(
+                        "status_reason",
+                        "Dataset split originates from a single photo collection session; independence is unverified.",
+                    )
+                    break
+            except Exception:
+                pass
+
+    if allow_missing_unknown:
+        is_calib_provisional = True
+        is_test_provisional = True
+        if manifest_provisional_reason is None:
+            manifest_provisional_reason = (
+                "Calibrated in provisional mode without unknown/distractor captures (--allow-missing-unknown). "
+                "Evaluated positive matches and inter-checkpoint discrimination only; unknown rejection is unmeasured."
+            )
+
 
     if is_calib_provisional:
         warning_msg = (
@@ -466,6 +510,7 @@ def run_calibration(
         sample_counts=calib_dataset.sample_counts,
         min_samples_per_location=effective_min_calib_samples,
         min_unknown_samples=effective_min_calib_unknown,
+        allow_missing_unknown=allow_missing_unknown,
     )
 
     if not is_adequate:
@@ -500,7 +545,12 @@ def run_calibration(
 
     print("\n" + "=" * 80)
     print("CALIBRATION SET THRESHOLD & MARGIN SEARCH (data/calibration/)")
-    print(f"Constraints: FAR <= {effective_max_far * 100:.2f}%, Unknown Rejection >= {effective_min_unknown_rejection * 100:.1f}%")
+    constraint_unk_str = (
+        f"Unknown Rejection >= {effective_min_unknown_rejection * 100:.1f}%"
+        if not allow_missing_unknown
+        else "Unknown Rejection: N/A (provisional mode)"
+    )
+    print(f"Constraints: FAR <= {effective_max_far * 100:.2f}%, {constraint_unk_str}")
     print("=" * 80)
     print(
         f"{'Match Thresh':<14} {'Margin':<10} {'Accept Rate':<14} {'False Accept (FAR)':<20} {'Unknown Reject':<16} {'Meets Constraints'}"
@@ -524,10 +574,18 @@ def run_calibration(
             )
             all_results.append(res)
 
-            meets_constraints = (
-                res["wrong_false_accept_rate"] <= effective_max_far
-                and res["unknown_rejection_rate"] >= effective_min_unknown_rejection
-            )
+            if res["unknown_rejection_rate"] is not None:
+                meets_constraints = (
+                    res["wrong_false_accept_rate"] <= effective_max_far
+                    and res["unknown_rejection_rate"] >= effective_min_unknown_rejection
+                )
+                unk_val_str = f"{res['unknown_rejection_rate'] * 100:>14.1f}%   "
+            else:
+                meets_constraints = (
+                    res["wrong_false_accept_rate"] <= effective_max_far
+                )
+                unk_val_str = "           N/A   "
+
             status_str = "YES" if meets_constraints else "NO"
 
             print(
@@ -535,7 +593,7 @@ def run_calibration(
                 f"{res['margin_threshold']:<10.2f} "
                 f"{res['correct_accept_rate'] * 100:>10.1f}%   "
                 f"{res['wrong_false_accept_rate'] * 100:>14.2f}%   "
-                f"{res['unknown_rejection_rate'] * 100:>14.1f}%   "
+                f"{unk_val_str}"
                 f"{status_str:>17}"
             )
 
@@ -564,11 +622,18 @@ def run_calibration(
         print("!" * 80)
         print(f"Required: FAR <= {effective_max_far * 100:.2f}%, Unknown Rejection >= {effective_min_unknown_rejection * 100:.1f}%")
         print("Closest candidates evaluated (for diagnosis):")
-        sorted_candidates = sorted(all_results, key=lambda x: (x["wrong_false_accept_rate"], -x["unknown_rejection_rate"]))
+        sorted_candidates = sorted(
+            all_results,
+            key=lambda x: (
+                x["wrong_false_accept_rate"],
+                -(x["unknown_rejection_rate"] if x["unknown_rejection_rate"] is not None else 0.0),
+            ),
+        )
         for c in sorted_candidates[:5]:
+            rej_str = f"{c['unknown_rejection_rate']*100:.1f}%" if c['unknown_rejection_rate'] is not None else "N/A"
             print(
                 f"  Match={c['match_threshold']:.2f}, Margin={c['margin_threshold']:.2f} -> "
-                f"FAR={c['wrong_false_accept_rate']*100:.2f}%, Rejection={c['unknown_rejection_rate']*100:.1f}%, Accept={c['correct_accept_rate']*100:.1f}%"
+                f"FAR={c['wrong_false_accept_rate']*100:.2f}%, Rejection={rej_str}, Accept={c['correct_accept_rate']*100:.1f}%"
             )
         print("!" * 80 + "\n")
 
@@ -612,7 +677,8 @@ def run_calibration(
     print(f"  Selected Margin Threshold:     {best_config['margin_threshold']:.3f}")
     print(f"  Calibration Acceptance Rate:   {best_config['correct_accept_rate'] * 100:.1f}%")
     print(f"  Calibration Wrong Location FAR:{best_config['wrong_false_accept_rate'] * 100:.2f}%")
-    print(f"  Calibration Unknown Rejection: {best_config['unknown_rejection_rate'] * 100:.1f}%\n")
+    calib_unk_disp = f"{best_config['unknown_rejection_rate'] * 100:.1f}%" if best_config["unknown_rejection_rate"] is not None else "N/A (Provisional)"
+    print(f"  Calibration Unknown Rejection: {calib_unk_disp}\n")
 
     print_confusion_matrix(best_config["confusion_counts"], store.locations, title="CALIBRATION CONFUSION MATRIX")
 
@@ -659,6 +725,7 @@ def run_calibration(
             sample_counts=test_dataset.sample_counts,
             min_samples_per_location=effective_min_test_samples,
             min_unknown_samples=effective_min_test_unknown,
+            allow_missing_unknown=allow_missing_unknown,
         )
 
         if not is_test_complete:
@@ -700,9 +767,14 @@ def run_calibration(
             print("\n" + "=" * 80)
             print(test_title)
             print("=" * 80)
+            test_unk_disp = (
+                f"{test_res['unknown_rejection_rate'] * 100:.1f}%"
+                if test_res["unknown_rejection_rate"] is not None
+                else "N/A (Provisional)"
+            )
             print(f"  Test Correct Acceptance Rate:  {test_res['correct_accept_rate'] * 100:.1f}%")
             print(f"  Test Wrong Location FAR:       {test_res['wrong_false_accept_rate'] * 100:.2f}%")
-            print(f"  Test Unknown Rejection Rate:   {test_res['unknown_rejection_rate'] * 100:.1f}%")
+            print(f"  Test Unknown Rejection Rate:   {test_unk_disp}")
             if is_test_provisional:
                 print("  NOTICE: Safeguards lowered below standard; results are provisional and do not establish verified generalization.")
             print("=" * 80 + "\n")
@@ -711,7 +783,8 @@ def run_calibration(
 
             test_status_val: Literal["completed", "provisional"] = "provisional" if is_test_provisional else "completed"
             test_reason_val: Optional[str] = (
-                "Evaluated with manually lowered sample safeguards. Results are provisional and do not guarantee generalization."
+                manifest_provisional_reason
+                or "Evaluated with manually lowered sample safeguards. Results are provisional and do not guarantee generalization."
                 if is_test_provisional
                 else None
             )
@@ -726,7 +799,11 @@ def run_calibration(
                 metrics=CalibrationMetrics(
                     correct_accept_rate=round(test_res["correct_accept_rate"], 4),
                     wrong_false_accept_rate=round(test_res["wrong_false_accept_rate"], 6),
-                    unknown_rejection_rate=round(test_res["unknown_rejection_rate"], 4),
+                    unknown_rejection_rate=(
+                        round(test_res["unknown_rejection_rate"], 4)
+                        if test_res["unknown_rejection_rate"] is not None
+                        else None
+                    ),
                     correct_trials=test_res["correct_trials"],
                     correct_accepts=test_res["correct_accepts"],
                     wrong_trials=test_res["wrong_trials"],
@@ -743,10 +820,13 @@ def run_calibration(
 
         calib_status_val: Literal["calibrated", "provisional"] = "provisional" if is_calib_provisional else "calibrated"
         calib_warning_val: Optional[str] = (
-            f"Sample safeguards were manually set below project standards "
-            f"({DEFAULT_MIN_CALIBRATION_SAMPLES_PER_LOCATION} per location, "
-            f"{DEFAULT_MIN_CALIBRATION_UNKNOWN_SAMPLES} unknown). "
-            "Thresholds are provisional and require further real campus data collection."
+            manifest_provisional_reason
+            or (
+                f"Sample safeguards were manually set below project standards "
+                f"({DEFAULT_MIN_CALIBRATION_SAMPLES_PER_LOCATION} per location, "
+                f"{DEFAULT_MIN_CALIBRATION_UNKNOWN_SAMPLES} unknown). "
+                "Thresholds are provisional and require further real campus data collection."
+            )
             if is_calib_provisional
             else None
         )
@@ -793,7 +873,11 @@ def run_calibration(
                 calibration_metrics=CalibrationMetrics(
                     correct_accept_rate=round(best_config["correct_accept_rate"], 4),
                     wrong_false_accept_rate=round(best_config["wrong_false_accept_rate"], 6),
-                    unknown_rejection_rate=round(best_config["unknown_rejection_rate"], 4),
+                    unknown_rejection_rate=(
+                        round(best_config["unknown_rejection_rate"], 4)
+                        if best_config["unknown_rejection_rate"] is not None
+                        else None
+                    ),
                     correct_trials=best_config["correct_trials"],
                     correct_accepts=best_config["correct_accepts"],
                     wrong_trials=best_config["wrong_trials"],
@@ -907,6 +991,12 @@ def main() -> None:
         help="Compute device for image embedding (default: cpu)",
     )
     parser.add_argument(
+        "--allow-missing-unknown",
+        action="store_true",
+        default=False,
+        help="Permit provisional calibration and test evaluation without unknown/distractor captures.",
+    )
+    parser.add_argument(
         "--allow-unvalidated-auto-accept",
         action="store_true",
         default=False,
@@ -944,6 +1034,7 @@ def main() -> None:
         min_test_unknown_samples=args.min_test_unknown,
         device=args.device,
         base_config=cfg,
+        allow_missing_unknown=args.allow_missing_unknown,
     )
 
     if not success:

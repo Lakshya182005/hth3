@@ -4,18 +4,20 @@ Place hold-out test captures here to evaluate final generalization performance o
 
 ```
 data/test/
+  ├── 2nd_floor_clock/
+  │   ├── test_photo1.jpg
+  │   └── test_photo2.jpg
   ├── clock_tower/
   │   ├── test_photo1.jpg
   │   └── test_photo2.jpg
-  ├── library_atrium/
-  │   └── test_photo1.jpg
   └── unknown/
       ├── off_campus.jpg
       └── parking_lot.jpg
 ```
 
 ## Guidelines:
-1. **Strict Hold-Out**: Photos here are evaluated **only once** on the selected thresholds chosen from calibration data. They must never be used to choose or adjust thresholds.
+1. **Stable Location IDs**: Subdirectories for hunt locations must **strictly match the exact stable IDs** established in `data/reference/` and documented in `data/location_id_map.csv`, alongside the mandatory `unknown/` distractor folder. Mismatched or alternate spellings will fail hold-out evaluation.
+2. **Strict Hold-Out**: Photos here are evaluated **only once** on the selected thresholds chosen from calibration data. They must never be used to choose or adjust thresholds.
 2. **Sample Safeguards (Minimum Counts)**:
    - Provide **at least 5 independent captures per hunt location**.
    - Provide **at least 10 unknown/distractor captures** in `unknown/`.

@@ -100,3 +100,41 @@ def test_evaluate_thresholds_metric_calculation(mock_reference_store):
     assert conf["clock_tower"]["unaccepted_ambiguous"] == 1
     assert conf["library_atrium"]["library_atrium"] == 1
 
+
+def test_evaluate_thresholds_no_unknown_samples_sets_null_metrics(mock_reference_store):
+    """When no unknown samples are provided, unknown metrics must be None (null in JSON)."""
+    scorer = SimilarityScorer()
+    scoring_config = ScoringConfig(min_reference_images_per_location=1)
+
+    samples = [
+        {
+            "actual": "clock_tower",
+            "file": "c1.jpg",
+            "scores": {"clock_tower": 0.85, "library_atrium": 0.40, "science_quad": 0.20},
+        },
+        {
+            "actual": "library_atrium",
+            "file": "l1.jpg",
+            "scores": {"clock_tower": 0.30, "library_atrium": 0.88, "science_quad": 0.25},
+        },
+    ]
+
+    metrics = evaluate_thresholds(
+        samples=samples,
+        store=mock_reference_store,
+        scorer=scorer,
+        base_scoring_config=scoring_config,
+        match_threshold=0.60,
+        margin_threshold=0.08,
+    )
+
+    assert metrics["correct_trials"] == 2
+    assert metrics["correct_accepts"] == 2
+    assert metrics["correct_accept_rate"] == 1.0
+
+    # Unknown metrics MUST be None
+    assert metrics["unknown_trials"] is None
+    assert metrics["unknown_rejections"] is None
+    assert metrics["unknown_rejection_rate"] is None
+
+

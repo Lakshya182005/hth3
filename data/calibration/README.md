@@ -4,18 +4,20 @@ Place labeled campus captures here to calibrate similarity and margin thresholds
 
 ```
 data/calibration/
+  ├── 2nd_floor_clock/
+  │   ├── photo1.jpg
+  │   └── photo2.jpg
   ├── clock_tower/
   │   ├── photo1.jpg
   │   └── photo2.jpg
-  ├── library_atrium/
-  │   └── photo1.jpg
   └── unknown/
       ├── cafeteria.jpg
       └── dorm_hallway.jpg
 ```
 
 ## Guidelines:
-1. **Independent Split**: Photos must be completely separate captures from `data/reference/` and `data/test/`. **Never copy or leak images across splits.**
+1. **Stable Location IDs**: Subdirectories for hunt locations must **strictly match the exact stable IDs** established in `data/reference/` and documented in `data/location_id_map.csv`, alongside the mandatory `unknown/` distractor folder. Mismatched or alternate spellings will fail data adequacy checks.
+2. **Independent Split**: Photos must be completely separate captures from `data/reference/` and `data/test/`. **Never copy or leak images across splits.**
 2. **Sample Safeguards (Minimum Counts)**:
    - Provide **at least 5 independent captures per hunt location**.
    - Provide **at least 10 unknown/distractor captures** in `unknown/`.

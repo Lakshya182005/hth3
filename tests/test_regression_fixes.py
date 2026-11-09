@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import sys
+from unittest.mock import patch
 import numpy as np
 from pydantic import ValidationError
 import pytest
@@ -215,6 +216,128 @@ def test_fix2_missing_unknown_fails_adequacy(mock_reference_store: ReferenceEmbe
 
     assert is_adequate is False
     assert any("unknown" in m for m in missing)
+
+
+def test_calibration_allow_missing_unknown_passes_adequacy(mock_reference_store: ReferenceEmbeddingsStore):
+    """When allow_missing_unknown is True, adequacy passes even without unknown directory."""
+    counts = {
+        "clock_tower": 5,
+        "library_atrium": 5,
+        "science_quad": 5,
+    }
+
+    # Strict mode fails
+    is_adequate_strict, missing_strict = check_calibration_data_adequacy(
+        store=mock_reference_store,
+        sample_counts=counts,
+        min_samples_per_location=5,
+        min_unknown_samples=10,
+        allow_missing_unknown=False,
+    )
+    assert is_adequate_strict is False
+    assert any("unknown" in m for m in missing_strict)
+
+    # Provisional mode passes
+    is_adequate_prov, missing_prov = check_calibration_data_adequacy(
+        store=mock_reference_store,
+        sample_counts=counts,
+        min_samples_per_location=5,
+        min_unknown_samples=10,
+        allow_missing_unknown=True,
+    )
+    assert is_adequate_prov is True
+    assert missing_prov == []
+
+
+def test_provisional_calibration_end_to_end_blocks_production_auto_accept(tmp_path: Path):
+    """Calibrating with allow_missing_unknown generates provisional config with null unknown metrics; verifier blocks auto-accept in production."""
+    calib_dir = tmp_path / "calib"
+    test_dir = tmp_path / "test"
+    calib_dir.mkdir()
+    test_dir.mkdir()
+
+    # Create mock calibration and test images for 2 locations (no unknown)
+    # loc_a has red channel ~ 100, loc_b has red channel ~ 200
+    for loc in ["loc_a", "loc_b"]:
+        (calib_dir / loc).mkdir()
+        (test_dir / loc).mkdir()
+        r_val = 100 if loc == "loc_a" else 200
+        for i in range(5):
+            img_bytes = create_test_image_bytes(width=50, height=50, color=(r_val, 100, 100))
+            (calib_dir / loc / f"img_{i}.jpg").write_bytes(img_bytes)
+            (test_dir / loc / f"img_{i}.jpg").write_bytes(img_bytes)
+
+    npz_path = tmp_path / "emb.npz"
+    meta_path = tmp_path / "meta.json"
+    out_cfg = tmp_path / "calibrated_thresholds.json"
+
+    # Reference embeddings for loc_a and loc_b
+    dim = 64
+    rng = np.random.RandomState(42)
+    v_a = rng.randn(dim).astype(np.float32)
+    v_a /= np.linalg.norm(v_a)
+    v_b = rng.randn(dim).astype(np.float32)
+    v_b /= np.linalg.norm(v_b)
+
+    ReferenceEmbeddingsStore.save(
+        npz_path=npz_path,
+        metadata_path=meta_path,
+        embeddings_by_location={"loc_a": np.stack([v_a, v_a]), "loc_b": np.stack([v_b, v_b])},
+        model_name="ViT-B-32",
+        pretrained="laion2b_s34b_b79k",
+    )
+
+    class ControlledEmbedder(MockEmbedder):
+        def __init__(self, dimension):
+            super().__init__(dimension=dimension, model_version_str="ViT-B-32/laion2b_s34b_b79k")
+
+        def embed_image(self, image):
+            arr = np.array(image.convert("RGB"))
+            if arr[0, 0, 0] > 150:
+                return v_b.copy()
+            return v_a.copy()
+
+    with patch("campus_hunt_cv.cli.calibrate.OpenCLIPLocationEmbedder", return_value=ControlledEmbedder(dimension=dim)):
+        success = run_calibration(
+            calibration_dir=calib_dir,
+            test_dir=test_dir,
+            embeddings_npz=npz_path,
+            metadata_json=meta_path,
+            output_config=out_cfg,
+            allow_missing_unknown=True,
+            candidate_match_thresholds=[0.50, 0.60],
+            candidate_margins=[0.05],
+        )
+
+    assert success is True
+    assert out_cfg.exists()
+
+    config = CampusHuntConfig.from_json_file(out_cfg)
+    assert config.scoring.calibrated is True
+    assert config.calibration_metadata.status == "provisional"
+    assert config.calibration_metadata.is_provisional is True
+    assert config.calibration_metadata.calibration_metrics.unknown_rejection_rate is None
+    assert config.calibration_metadata.calibration_metrics.unknown_trials is None
+    assert config.calibration_metadata.calibration_metrics.unknown_rejections is None
+
+    # Verify runtime behavior: In production, auto-accept MUST be blocked
+    store = ReferenceEmbeddingsStore.load(npz_path=npz_path, metadata_path=meta_path)
+    verifier = LocationVerifier(
+        config=config,
+        embedder=ControlledEmbedder(dimension=dim),
+        store=store,
+    )
+
+    test_img = create_test_image_bytes(width=50, height=50)
+    result = verifier.verify(image_bytes=test_img, target_location_id="loc_a")
+
+    # In production, even if raw match succeeds, gate forces ambiguous
+    assert result["result"] == "ambiguous"
+    assert result["reason_code"] == "PROVISIONAL_CALIBRATION_REQUIRES_REVIEW"
+    # Scores are preserved for admin review
+    assert result["target_score"] is not None
+    assert result["best_matching_location_id"] == "loc_a"
+
 
 
 def test_fix2_empty_calibration_dir_refuses_to_write_config(tmp_path: Path):

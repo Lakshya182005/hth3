@@ -94,6 +94,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         default=None,
         help="Optional path to write structured JSON audit report",
     )
+    parser.add_argument(
+        "--allow-missing-unknown",
+        action="store_true",
+        default=False,
+        help="Permit provisional audit without unknown/ distractor folders. Reports as structurally split but provisional.",
+    )
 
     args = parser.parse_args(argv)
 
@@ -114,6 +120,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         min_calibration_unknown_samples=args.min_calib_unknown,
         min_test_samples_per_location=args.min_test_samples,
         min_test_unknown_samples=args.min_test_unknown,
+        allow_missing_unknown=args.allow_missing_unknown,
     )
 
     # Print human-readable summary

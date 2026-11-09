@@ -219,13 +219,13 @@ class CalibrationMetrics(BaseModel):
 
     correct_accept_rate: float = Field(ge=0.0, le=1.0)
     wrong_false_accept_rate: float = Field(ge=0.0, le=1.0)
-    unknown_rejection_rate: float = Field(ge=0.0, le=1.0)
+    unknown_rejection_rate: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     correct_trials: int = Field(default=0, ge=0)
     correct_accepts: int = Field(default=0, ge=0)
     wrong_trials: int = Field(default=0, ge=0)
     wrong_false_accepts: int = Field(default=0, ge=0)
-    unknown_trials: int = Field(default=0, ge=0)
-    unknown_rejections: int = Field(default=0, ge=0)
+    unknown_trials: Optional[int] = Field(default=None, ge=0)
+    unknown_rejections: Optional[int] = Field(default=None, ge=0)
 
 
 class TestEvaluationMetrics(BaseModel):
