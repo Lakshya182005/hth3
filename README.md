@@ -316,6 +316,23 @@ result = verify_location(
 | `reason_code` | `str` | Actionable machine-readable code explaining the verdict. |
 | `model_version` | `str` | Model identifier (e.g. `ViT-B-32/laion2b_s34b_b79k`). |
 
+### Developer CLI Verification (`campus-hunt-verify`)
+
+For developer testing of individual image submissions against target checkpoints:
+
+```bash
+# Verify an image using positional arguments:
+campus-hunt-verify data/test/ashok_goel_library/photo1.jpg ashok_goel_library
+
+# Or using explicit flags with custom configuration:
+campus-hunt-verify \
+  --image data/test/ashok_goel_library/photo1.jpg \
+  --target ashok_goel_library \
+  --config calibrated_thresholds.json
+```
+
+Outputs the structured verification result as JSON to stdout. Uses the existing model, precomputed reference embeddings, configuration, and production safety gate.
+
 ---
 
 ## 8. Calibrated Configuration JSON Format

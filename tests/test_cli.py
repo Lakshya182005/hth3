@@ -1,6 +1,8 @@
 """Unit tests for CLI utilities and calibration metric evaluation."""
 
+import json
 from pathlib import Path
+import numpy as np
 import pytest
 
 from campus_hunt_cv.cli.build_embeddings import build_reference_embeddings
@@ -10,8 +12,11 @@ from campus_hunt_cv.cli.calibrate import (
     format_focused_confusion_report,
     print_confusion_matrix,
 )
-from campus_hunt_cv.config import ScoringConfig
+from campus_hunt_cv.cli.verify import main as verify_main, verify_image_file
+from campus_hunt_cv.config import CampusHuntConfig, ScoringConfig
 from campus_hunt_cv.similarity import SimilarityScorer
+from campus_hunt_cv.verifier import LocationVerifier
+from tests.conftest import MockEmbedder, create_test_image_bytes
 
 
 def test_build_embeddings_empty_dir_graceful(tmp_path: Path):
@@ -231,6 +236,175 @@ def test_format_cross_location_errors_and_focused_report():
     # When no incidents match the pair
     empty_focused = format_focused_confusion_report([], "loc_x", "loc_y")
     assert "No cross-location false acceptances detected" in empty_focused
+
+
+def test_cli_verify_positional_arguments_success(
+    tmp_path: Path,
+    calibrated_config: CampusHuntConfig,
+    mock_reference_store,
+    capsys,
+):
+    """Test campus-hunt-verify with positional arguments prints valid JSON and returns 0."""
+    img_bytes = create_test_image_bytes(width=64, height=64)
+    img_path = tmp_path / "query.jpg"
+    img_path.write_bytes(img_bytes)
+
+    embedder = MockEmbedder(dimension=64)
+    verifier = LocationVerifier(
+        config=calibrated_config,
+        embedder=embedder,
+        store=mock_reference_store,
+    )
+
+    exit_code = verify_main([str(img_path), "clock_tower"], verifier=verifier)
+    assert exit_code == 0
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert "result" in payload
+    assert payload["result"] in ("strong_match", "ambiguous", "mismatch")
+    assert "target_score" in payload
+    assert "best_matching_location_id" in payload
+    assert "best_matching_score" in payload
+    assert "best_competing_location_id" in payload
+    assert "best_competing_score" in payload
+    assert "margin" in payload
+    assert "reason_code" in payload
+    assert "model_version" in payload
+    assert payload["model_version"] == embedder.model_version
+
+
+def test_cli_verify_flag_arguments_success(
+    tmp_path: Path,
+    calibrated_config: CampusHuntConfig,
+    mock_reference_store,
+    capsys,
+):
+    """Test campus-hunt-verify with --image and --target flags."""
+    img_bytes = create_test_image_bytes(width=64, height=64)
+    img_path = tmp_path / "query.jpg"
+    img_path.write_bytes(img_bytes)
+
+    embedder = MockEmbedder(dimension=64)
+    verifier = LocationVerifier(
+        config=calibrated_config,
+        embedder=embedder,
+        store=mock_reference_store,
+    )
+
+    exit_code = verify_main(["--image", str(img_path), "--target", "library_atrium"], verifier=verifier)
+    assert exit_code == 0
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["result"] in ("strong_match", "ambiguous", "mismatch")
+    assert payload["target_score"] is not None
+
+
+def test_cli_verify_missing_arguments_fails():
+    """Missing positional or flag arguments must raise SystemExit with exit code 2."""
+    with pytest.raises(SystemExit) as exc_info:
+        verify_main([])
+    assert exc_info.value.code == 2
+
+
+def test_cli_verify_file_not_found_returns_error(capsys):
+    """Non-existent image file must return exit code 1 and structured error JSON."""
+    exit_code = verify_main(["nonexistent_photo_123.jpg", "clock_tower"])
+    assert exit_code == 1
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["result"] == "ambiguous"
+    assert payload["reason_code"] == "ERROR_FILE_NOT_FOUND"
+
+
+def test_cli_verify_preserves_provisional_safety_gate(
+    tmp_path: Path,
+    mock_reference_store,
+    capsys,
+):
+    """CLI must enforce production safety gate and downgrade provisional strong_match to ambiguous."""
+    from campus_hunt_cv.config import CalibrationMetadata, CalibrationMetrics, TestEvaluationMetrics
+
+    # Build provisional production configuration
+    cfg = CampusHuntConfig()
+    cfg.environment = "production"
+    cfg.scoring.calibrated = True
+    cfg.scoring.match_threshold = 0.50
+    cfg.scoring.margin_threshold = 0.05
+    cfg.calibration_metadata = CalibrationMetadata(
+        status="provisional",
+        is_provisional=True,
+        warning="Provisional run without unknown/ distractors",
+        provisional_reasons=["Unknown evaluation unavailable"],
+        model_version="ViT-B-32/mock_test_weights",
+        calibrated_at="2026-11-10T12:00:00Z",
+        calibration_sample_counts={"clock_tower": 5, "library_atrium": 5},
+        calibration_metrics=CalibrationMetrics(correct_accept_rate=1.0, wrong_false_accept_rate=0.0),
+        test_evaluation=TestEvaluationMetrics(
+            status="provisional",
+            is_provisional=True,
+            reason="Provisional test split",
+            metrics=CalibrationMetrics(correct_accept_rate=1.0, wrong_false_accept_rate=0.0),
+        ),
+    )
+
+    # Force query embedding to be identical to clock_tower reference center
+    clock_ref = mock_reference_store.get_location_embeddings("clock_tower")[0]
+
+    class PerfectMatchEmbedder(MockEmbedder):
+        def embed_image(self, image):
+            return clock_ref.copy()
+
+    verifier = LocationVerifier(
+        config=cfg,
+        embedder=PerfectMatchEmbedder(dimension=64),
+        store=mock_reference_store,
+    )
+
+    img_bytes = create_test_image_bytes()
+    img_path = tmp_path / "match.jpg"
+    img_path.write_bytes(img_bytes)
+
+    exit_code = verify_main([str(img_path), "clock_tower"], verifier=verifier)
+    assert exit_code == 0
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    # Score and margin exceed thresholds, but safety gate downgrades to ambiguous
+    assert payload["target_score"] >= 0.90
+    assert payload["best_matching_location_id"] == "clock_tower"
+    assert payload["result"] == "ambiguous"
+    assert payload["reason_code"] == "PROVISIONAL_CALIBRATION_REQUIRES_REVIEW"
+
+
+def test_verify_image_file_direct_helper(
+    tmp_path: Path,
+    calibrated_config: CampusHuntConfig,
+    mock_reference_store,
+):
+    """Direct helper verify_image_file must load file bytes and return response dict."""
+    img_bytes = create_test_image_bytes()
+    img_path = tmp_path / "direct.jpg"
+    img_path.write_bytes(img_bytes)
+
+    embedder = MockEmbedder(dimension=64)
+    verifier = LocationVerifier(
+        config=calibrated_config,
+        embedder=embedder,
+        store=mock_reference_store,
+    )
+
+    result = verify_image_file(img_path, "clock_tower", verifier=verifier)
+    assert isinstance(result, dict)
+    assert "result" in result
+    assert result["result"] in ("strong_match", "ambiguous", "mismatch")
+    assert isinstance(result["reason_code"], str)
+    assert result["model_version"] == embedder.model_version
+
 
 
 

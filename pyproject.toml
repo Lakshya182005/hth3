@@ -29,6 +29,7 @@ campus-hunt-build-embeddings = "campus_hunt_cv.cli.build_embeddings:main"
 campus-hunt-calibrate = "campus_hunt_cv.cli.calibrate:main"
 campus-hunt-audit-data = "campus_hunt_cv.cli.audit_data:main"
 campus-hunt-split-data = "campus_hunt_cv.cli.split_data:main"
+campus-hunt-verify = "campus_hunt_cv.cli.verify:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
